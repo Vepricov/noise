@@ -17,6 +17,9 @@ The estimator, the optimizers and the work split are #32's, unchanged (below). W
     (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
     weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
     own CUDA graph, captured in the warmup.
+  - The alternating skip (`--skip alternate`, ours): the same measurement budget, but the skipped half changes every
+    update (blocks 0, 2, 4, 6, then 1, 3, 5, 7), so every block's queries, keys and values keep learning, each every
+    other update: a block-coordinate step, as in zero-order methods that refresh part of the coordinates per step.
   - The run length (`--updates`): N = 400 updates instead of 600, the first N batches of #32's data order, with every
     schedule (the row-length switch at 0.5 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length. Three
     constants go with it: the Adam rate of the LM head and the value-embedding gates 0.006 (#32: 0.003), ANVIL II's
@@ -105,6 +108,7 @@ START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head
 EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
 START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: #32's recipe)
 SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
+SKIP_ODD, ALTERNATE = (1, 3, 5, 7), False  # --skip alternate: the skipped half changes every update
 READOUT_FP32 = False  # #38: the readout cycle's first-order product in full fp32 (#29's HIGHEST), here TF32
 GRAD_BF16 = True  # the weight-gradient products on the forward's bf16 inputs, fp32 out (#38: TF32 on fp32 copies)
 
@@ -195,8 +199,8 @@ class Model:
         self.lm_head_bf = self.lm_head.to(BF16)
         self.gates_bf = {i: g.to(BF16) for i, g in self.gates.items()}
         self.ema = [torch.zeros(w.shape, device=device) for w in self.averaged()] if EMA else None
-        self.skip_rows = {SKIP_BLOCKS: torch.tensor([kind * L + i for kind in range(3) for i in SKIP_BLOCKS],
-                                                    device=device)}  # the square stack's q, k, v rows of the skip
+        self.skip_rows = {s: torch.tensor([kind * L + i for kind in range(3) for i in s], device=device)
+                          for s in (SKIP_BLOCKS, SKIP_ODD)}  # the square stack's q, k, v rows of each skip
         mod = lambda w: (lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w))
         self.masks = {(w, t): create_block_mask(mod(w), None, None, t, t, device=device)
                       for w in (SEQ // 2, SEQ) for t in (WARMUP_LEN, SEQ)}
@@ -781,7 +785,7 @@ MODEL = None
 
 
 def main():
-    global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP
+    global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP, ALTERNATE
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
@@ -790,7 +794,7 @@ def main():
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: #32's init")
     parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
-    parser.add_argument('--skip', choices=('late', 'none'), default='late',
+    parser.add_argument('--skip', choices=('late', 'alternate', 'none'), default='late',
                         help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
     args = parser.parse_args()
     STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates // 2, args.updates * 2 // 5, args.seed
@@ -813,7 +817,9 @@ def main():
     snapshot = [x.clone() for x in model.tensors()]
     graphs = {}
     steps_of = (train_step, average_step) if EMA else (train_step,)  # the tail average's updates: their own graphs
-    skips = ((), SKIP_BLOCKS) if SKIP else ((),)  # and the late skip's
+    ALTERNATE = args.skip == 'alternate'
+    SKIP = SKIP or ALTERNATE
+    skips = ((), SKIP_BLOCKS, SKIP_ODD) if ALTERNATE else ((), SKIP_BLOCKS) if SKIP else ((),)  # and each skip's
     for length in (WARMUP_LEN, SEQ):  # warmup on random tokens (model.rows is random until training), then capture
         for update in steps_of:
             for skip in skips:
@@ -827,7 +833,7 @@ def main():
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     update(model, length, skip)
-                graphs[length, update is average_step, bool(skip)] = g
+                graphs[length, update is average_step, skip] = g
     with torch.no_grad():  # training starts from the untouched state, on the real batches
         for x, s in zip(model.tensors(), snapshot):
             x.copy_(s)
@@ -843,7 +849,8 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
             script='train/speedrun/run.py', port_of='#29', world=world, batch=BATCH, steps=STEPS, seed=SEED,
-            init=args.init, skip=dict(blocks=SKIP_BLOCKS, start=round(SKIP_FROM * STEPS)) if SKIP else None,
+            init=args.init, skip=dict(blocks=SKIP_BLOCKS, start=round(SKIP_FROM * STEPS), alternate_with=SKIP_ODD if ALTERNATE
+            else None) if SKIP else None,
             ema=dict(mode=args.ema, start=round(EMA_FROM * STEPS), horizon=round(EMA_HORIZON * STEPS),
                      mix=EMA_MIX) if EMA else None,
             seq_warmup=f'{WARMUP_LEN}:{WARMUP_UNTIL}', cooldown=COOLDOWN, lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE,
@@ -853,7 +860,9 @@ def main():
     start = time.perf_counter()
     for step in range(total):
         length = WARMUP_LEN if step < WARMUP_UNTIL else SEQ
-        graphs[length, EMA and step > first, SKIP and step >= round(SKIP_FROM * STEPS)].replay()
+        skipping = SKIP and step >= round(SKIP_FROM * STEPS)
+        skip = (SKIP_ODD if ALTERNATE and step % 2 else SKIP_BLOCKS) if skipping else ()
+        graphs[length, EMA and step > first, skip].replay()
         if EMA and step == first:  # the average starts at the weights after this update
             torch._foreach_copy_(model.ema, [w.float() for w in model.averaged()])
     if EMA and total > first:  # the final weights: w + EMA_MIX (EMA - w), inside the timer
