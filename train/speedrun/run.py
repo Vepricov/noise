@@ -17,6 +17,9 @@ The estimator, the optimizers and the work split are #32's, unchanged (below). W
     (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
     weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
     own CUDA graph, captured in the warmup.
+  - What a skipped block does (`--skip-move`, ours): `frozen` keeps its q, k, v (the record); `momentum` lets ANVIL
+    step them on a zero gradient, i.e. on its momentum alone; `stale` steps them on the block's last measured
+    gradient, as zero-order methods with a gradient buffer refresh only part of the coordinates per step (one GPU).
   - The alternating skip (`--skip alternate`, ours): the same measurement budget, but the skipped half changes every
     update (blocks 0, 2, 4, 6, then 1, 3, 5, 7), so every block's queries, keys and values keep learning, each every
     other update: a block-coordinate step, as in zero-order methods that refresh part of the coordinates per step.
@@ -109,6 +112,7 @@ EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the 
 START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: #32's recipe)
 SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
 SKIP_ODD, ALTERNATE = (1, 3, 5, 7), False  # --skip alternate: the skipped half changes every update
+SKIP_MOVE = 'frozen'  # --skip-move: what a skipped block's q, k, v do (frozen / momentum / stale)
 READOUT_FP32 = False  # #38: the readout cycle's first-order product in full fp32 (#29's HIGHEST), here TF32
 GRAD_BF16 = True  # the weight-gradient products on the forward's bf16 inputs, fp32 out (#38: TF32 on fp32 copies)
 
@@ -199,6 +203,7 @@ class Model:
         self.lm_head_bf = self.lm_head.to(BF16)
         self.gates_bf = {i: g.to(BF16) for i, g in self.gates.items()}
         self.ema = [torch.zeros(w.shape, device=device) for w in self.averaged()] if EMA else None
+        self.stale = torch.zeros_like(self.owned['square'])  # --skip-move stale: the last measured q, k, v gradients
         self.skip_rows = {s: torch.tensor([kind * L + i for kind in range(3) for i in s], device=device)
                           for s in (SKIP_BLOCKS, SKIP_ODD)}  # the square stack's q, k, v rows of each skip
         mod = lambda w: (lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w))
@@ -696,7 +701,7 @@ def anvil_math(w, g, fast, slow, energy, lr, beta, fast_beta, weight, rates):
     return w - lr * rates[:, None, None] * (update + decay), fast, slow, energy
 
 
-def anvil_update(model, works, n):
+def anvil_update(model, works, n, skip=()):
     """Steps this GPU's share of each stack once its gradients arrive; returns the all-gathers in flight."""
     beta, fast_beta, weight = anvil_betas(model.step_t)
     lr = model.scale_t * ANVIL_LR
@@ -705,6 +710,11 @@ def anvil_update(model, works, n):
     for name, w in (('wide', model.wide), ('square', model.square)):
         works[name].wait()
         model.owned[name].div_(n)
+        if name == 'square' and SKIP_MOVE == 'stale':  # a skipped block steps on its last measured gradient
+            if skip:
+                rows = model.skip_rows[skip]
+                model.owned[name].index_copy_(0, rows, model.stale.index_select(0, rows))
+            model.stale.copy_(model.owned[name])
         rates = model.rates[name]
         per = w.shape[0] // world
         sl = slice(rank * per, (rank + 1) * per)
@@ -765,14 +775,14 @@ def train_step(model, length, skip=()):
         part = length // share
         lo, hi = (rank % share) * part, (rank % share + 1) * part
     loss, works, n = identity_grad(model, idx, tgt, lo, hi, rows_total, skip)
-    if skip:  # a skipped block's queries, keys and values get no credit, so no step at all (moves undone below)
+    if skip and SKIP_MOVE == 'frozen':  # a skipped block's q, k, v get no credit, so no step (moves undone below)
         rows_qkv = model.skip_rows[skip]
         frozen = model.square.index_select(0, rows_qkv)
-    gathers = anvil_update(model, works, n)  # from the weights before this step's Adam (the gradients are this step's)
+    gathers = anvil_update(model, works, n, skip)  # from the weights before this step's Adam (this step's gradients)
     adam_update(model, works, n)  # while the ANVIL matrices gather
     for work, _ in gathers:
         work.wait()
-    if skip:
+    if skip and SKIP_MOVE == 'frozen':
         model.square.index_copy_(0, rows_qkv, frozen)
     model.refresh_bf16()
     model.losses.index_copy_(0, model.step_t.long().view(1), loss.view(1))
@@ -785,7 +795,7 @@ MODEL = None
 
 
 def main():
-    global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP, ALTERNATE
+    global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP, ALTERNATE, SKIP_MOVE
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
@@ -794,6 +804,9 @@ def main():
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: #32's init")
     parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
+    parser.add_argument('--skip-move', choices=('frozen', 'momentum', 'stale'), default='frozen',
+                        help="a skipped block's q, k, v: kept (the record), stepped by the optimizer's momentum on a "
+                             "zero gradient, or stepped on the block's last measured gradient (one GPU)")
     parser.add_argument('--skip', choices=('late', 'alternate', 'none'), default='late',
                         help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
     args = parser.parse_args()
@@ -817,7 +830,9 @@ def main():
     snapshot = [x.clone() for x in model.tensors()]
     graphs = {}
     steps_of = (train_step, average_step) if EMA else (train_step,)  # the tail average's updates: their own graphs
-    ALTERNATE = args.skip == 'alternate'
+    ALTERNATE, SKIP_MOVE = args.skip == 'alternate', args.skip_move
+    if SKIP_MOVE == 'stale' and world != 1:
+        raise SystemExit('--skip-move stale keeps the whole square stack: one GPU')
     SKIP = SKIP or ALTERNATE
     skips = ((), SKIP_BLOCKS, SKIP_ODD) if ALTERNATE else ((), SKIP_BLOCKS) if SKIP else ((),)  # and each skip's
     for length in (WARMUP_LEN, SEQ):  # warmup on random tokens (model.rows is random until training), then capture
@@ -854,7 +869,7 @@ def main():
         (args.output / 'config.json').write_text(json.dumps(dict(
             script='train/speedrun/run.py', port_of='#29', world=world, batch=BATCH, steps=STEPS, seed=SEED,
             init=args.init, skip=dict(blocks=SKIP_BLOCKS, start=round(SKIP_FROM * STEPS), alternate_with=SKIP_ODD if ALTERNATE
-            else None) if SKIP else None,
+            else None, move=SKIP_MOVE) if SKIP else None,
             ema=dict(mode=args.ema, start=round(EMA_FROM * STEPS), horizon=round(EMA_HORIZON * STEPS),
                      mix=EMA_MIX) if EMA else None,
             seq_warmup=f'{WARMUP_LEN}:{WARMUP_UNTIL}', cooldown=COOLDOWN, lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE,
