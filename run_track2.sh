@@ -15,8 +15,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 save() { mkdir -p "$SHARE" && cp -r "$OUT"/. "$SHARE"/ 2>/dev/null || true; echo "=== copied to $SHARE"; }
 trap save EXIT
-pip install -q uv
-uv sync -q
+# the node's network to PyPI drops at times: retry the installs
+for i in 1 2 3 4 5; do pip install -q --timeout 120 uv && break; sleep 30; done
+for i in 1 2 3 4 5; do UV_HTTP_TIMEOUT=120 uv sync -q && break; sleep 30; done
 # prepare_data.py can abort at interpreter exit ("terminate called without an active exception") after it has
 # written and checked the files; the run only needs the files.
 uv run utils/prepare_data.py || true
