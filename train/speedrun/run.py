@@ -823,6 +823,10 @@ def main():
     for length in (WARMUP_LEN, SEQ):  # warmup on random tokens (model.rows is random until training), then capture
         for update in steps_of:
             for skip in skips:
+                # the alternating skip has a third skip set: capture only the phases that occur (no skip only before
+                # the skip start, which falls in the warmup rows; the tail average only on full rows), or 80 GB is short
+                if ALTERNATE and ((length == SEQ and skip == ()) or (update is average_step and length != SEQ)):
+                    continue
                 side = torch.cuda.Stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
