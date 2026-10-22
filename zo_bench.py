@@ -134,6 +134,27 @@ def compare(record, ref: Dict[str, torch.Tensor], other: Dict[str, torch.Tensor]
     return dict(block_raw=mean(raw), block_polar=mean(polar), block_raw_min=min(raw), other_raw=mean(rest))
 
 
+def diagnose(record, model, settings, x, y, out: Path, step) -> None:
+    """Where the record's estimate misses the gradient, and whether averaging seeds (noise) or more probe sources
+    (bias) closes it. Every estimate is compared with autograd of the true loss, matrix by matrix."""
+    truth = autograd_reference(model, x, y)
+    first, _ = estimate(record, record.Cut, model, settings, x, y, 1)
+    second, _ = estimate(record, record.Cut, model, settings, x, y, 2)
+    mean = {k: (first[k] + second[k]) / 2 for k in first}
+    deep, _ = estimate(record, record.Cut, model, record.Settings(future_layers=settings.model.n_layer), x, y, 1)
+    table = {}
+    for name, g in truth.items():
+        if g.norm() == 0:
+            continue
+        table[name] = {k: round(cosine(g, e[name]), 4) for k, e in
+                       (('seed1', first), ('seed2', second), ('mean', mean), ('future_all_blocks', deep))}
+        logger.info('%s %s', name, table[name])
+    summary = {k: compare(record, truth, e) for k, e in
+               (('seed1', first), ('mean', mean), ('future_all_blocks', deep))}
+    logger.info(json.dumps(summary))
+    out.write_text(json.dumps(dict(step=step, summary=summary, per_matrix=table), indent=2) + '\n')
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -149,6 +170,9 @@ def main() -> None:
                         help='chain directions from the credit covariance of a neighbouring batch')
     parser.add_argument('--complement', type=int, default=64, help='random complement directions added to each')
     parser.add_argument('--out', type=Path, default=Path('bench.json'))
+    parser.add_argument('--diagnose', action='store_true',
+                        help='per-matrix cosine of the record estimate with autograd: two seeds, their mean (noise '
+                             'or bias?), and future probes from every block')
     args = parser.parse_args()
 
     record = load_record(args.record)
@@ -167,6 +191,9 @@ def main() -> None:
     x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
     neighbour = rows[args.row + args.sequences:args.row + 2 * args.sequences].to(device)
 
+    if args.diagnose:
+        diagnose(record, model, settings, x, y, args.out, step)
+        return
     variants: List[tuple] = [('reference', record.Cut, settings, 1), ('reference_reseeded', record.Cut, settings, 2)]
     variants += [(f'chain_rows_{r}', partial_chain(record, r), settings, 1) for r in args.chain_rows]
     variants += [(f'key_draws_{k}', record.Cut, record.Settings(key_path_draws=k), 1) for k in args.key_draws]

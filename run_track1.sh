@@ -17,7 +17,10 @@ save() { mkdir -p "$SHARE" && cp -r "$OUT"/. "$SHARE"/ 2>/dev/null || true; echo
 trap save EXIT
 pip install -q uv
 uv sync -q
-uv run utils/prepare_data.py
+# prepare_data.py can abort at interpreter exit ("terminate called without an active exception") after it has
+# written and checked the files; the run only needs the files.
+uv run utils/prepare_data.py || true
+test -s data/train.pt && test -s data/val.pt
 # mpirun leaves OMPI/PMIX variables that torch.distributed would read; torchrun sets its own.
 for v in $(env | grep -oE "^(OMPI|PMIX|PMI)[A-Za-z0-9_]*"); do unset "$v"; done
 uv run torchrun --standalone --nproc_per_node=$GPUS train/val/run.py --output "$OUT" ${EXTRA_ARGS:-} 2>&1
