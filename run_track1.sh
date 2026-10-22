@@ -11,7 +11,8 @@ OUT=logs/$RUN_NAME
 SHARE=/home/jovyan/shares/SR006.nfs2/veprikov/noise/$RUN_NAME
 GPUS=$(nvidia-smi -L | wc -l)
 echo "=== noise $RUN_NAME commit $(git rev-parse HEAD) gpus $GPUS start $(date -Is)"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 save() { mkdir -p "$SHARE" && cp -r "$OUT"/. "$SHARE"/ 2>/dev/null || true; echo "=== copied to $SHARE"; }
 trap save EXIT
 pip install -q uv
