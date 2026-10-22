@@ -18,7 +18,9 @@ trap save EXIT
 pip install -q uv
 uv sync -q
 uv run utils/prepare_data.py
-uv run torchrun --standalone --nproc_per_node=$GPUS train/val/run.py --output "$OUT" ${EXTRA_ARGS:-}
+# mpirun leaves OMPI/PMIX variables that torch.distributed would read; torchrun sets its own.
+for v in $(env | grep -oE "^(OMPI|PMIX|PMI)[A-Za-z0-9_]*"); do unset "$v"; done
+uv run torchrun --standalone --nproc_per_node=$GPUS train/val/run.py --output "$OUT" ${EXTRA_ARGS:-} 2>&1
 echo "=== config.json"; cat "$OUT/config.json"
 echo "=== result.json"; cat "$OUT/result.json"
 echo "=== done $(date -Is)"
