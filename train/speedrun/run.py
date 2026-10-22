@@ -796,6 +796,10 @@ MODEL = None
 
 def main():
     global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP, ALTERNATE, SKIP_MOVE
+    global SKIP_FROM, SKIP_BLOCKS, SKIP_ODD, ANVIL_MAPS
+    SKIP_FROM, ANVIL_MAPS = args.skip_from, ANVIL_MAPS[:args.polar_iters]
+    SKIP_BLOCKS = tuple(int(b) for b in args.skip_blocks.split(','))
+    SKIP_ODD = tuple(i for i in range(L) if i not in SKIP_BLOCKS)
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
@@ -804,6 +808,11 @@ def main():
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: #32's init")
     parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
+    parser.add_argument('--skip-from', type=float, default=SKIP_FROM, help='the skip starts at this share of the run')
+    parser.add_argument('--skip-blocks', default=','.join(map(str, SKIP_BLOCKS)),
+                        help='the blocks skipped (comma list; --skip alternate takes the rest as its other half)')
+    parser.add_argument('--polar-iters', type=int, default=len(ANVIL_MAPS),
+                        help="ANVIL's polar factor from the first this many of its fixed maps (fewer: faster, rougher)")
     parser.add_argument('--skip-move', choices=('frozen', 'momentum', 'stale'), default='frozen',
                         help="a skipped block's q, k, v: kept (the record), stepped by the optimizer's momentum on a "
                              "zero gradient, or stepped on the block's last measured gradient (one GPU)")
@@ -873,7 +882,7 @@ def main():
             ema=dict(mode=args.ema, start=round(EMA_FROM * STEPS), horizon=round(EMA_HORIZON * STEPS),
                      mix=EMA_MIX) if EMA else None,
             seq_warmup=f'{WARMUP_LEN}:{WARMUP_UNTIL}', cooldown=COOLDOWN, lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE,
-            lr_value_embeds=LR_VE, lr_lambdas=LR_LAMBDAS, anvil_lr=ANVIL_LR, anvil_wd=ANVIL_WD), indent=2) + '\n')
+            polar_iters=len(ANVIL_MAPS), lr_value_embeds=LR_VE, lr_lambdas=LR_LAMBDAS, anvil_lr=ANVIL_LR, anvil_wd=ANVIL_WD), indent=2) + '\n')
         log = (args.output / 'metrics.jsonl').open('w')
     first = round(EMA_FROM * STEPS)  # the update at which the tail average starts
     start = time.perf_counter()
