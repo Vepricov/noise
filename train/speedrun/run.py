@@ -606,21 +606,26 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
         targets_o = torch.bmm(cred, model.square[3 * L:].transpose(1, 2)).to(BF16)
     run = [i for i in range(L) if i not in skip]  # the blocks whose attention experiments run (the late skip)
     k = len(run)
-    if k:  # the head pack goes out first, under the MLP credits
+    if k:  # the head pack goes out first, under the MLP credits (one GPU: it stays, every head runs here)
         send = pack_heads([mine(cache[f'h{i}.q']) for i in run], [mine(cache[f'h{i}.k']) for i in run],
                           [mine(cache[f'h{i}.values']) for i in run],
                           [mine(cache[f'h{i}.in.attn.c_proj']) for i in run], [targets_o[i] for i in run],
                           [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H)[lo:hi].contiguous().view(BF16)
                            for i in run])  # [b, h, t] -> by token, every row of this GPU's
-        got = torch.empty_like(send)
-        sent = dist.all_to_all_single(got, send, async_op=True)  # [source GPU (its tokens), k, m, PACK]
+        if world > 1:
+            got = torch.empty_like(send)
+            sent = dist.all_to_all_single(got, send, async_op=True)  # [source GPU (its tokens), k, m, PACK]
     hidden = hidden_credits(us, cred, model.wide_bf[L:])
     weight_grad(cred.transpose(1, 2), acts, gwide[L:])  # mlp.c_proj, oriented (out, in)
     weight_grad(n2s.transpose(1, 2), hidden, gwide[:L])  # mlp.c_fc
     weight_grad(os_.transpose(1, 2), cred, gsq[3 * L:])  # attn.c_proj
     # the MLP matrices' gradients are complete: reduce them while the head credits run
     works = dict(wide=dist.reduce_scatter_tensor(model.owned['wide'], model.grad['wide'], async_op=True))
-    if k:  # one head per GPU: this GPU's head over the batch
+    if k and world == 1:  # every head here, one after another: [h, k, 3, m, hd] -> by token [k, 3, m, d]
+        res = torch.stack([torch.stack([head_credits(send[h, j].view(rows_total, t, PACK), rope32, window(i))
+                                        for j, i in enumerate(run)]) for h in range(H)])
+        by_token_one = res.permute(1, 2, 3, 0, 4).reshape(k, 3, m, D)
+    elif k:  # one head per GPU: this GPU's head over the batch
         sent.wait()
         whole = got.permute(1, 0, 2, 3).reshape(k, rows_total, t, PACK)
         res = torch.stack([head_credits(whole[j], rope32, window(i)) for j, i in enumerate(run)])  # [k, 3, n, hd]
@@ -633,7 +638,9 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
     model.grad['lam_r'].copy_(scal_r)
     model.grad['lam_0'].copy_(scal_0)
     by_token = None
-    if k:
+    if k and world == 1:
+        by_token = by_token_one
+    elif k:
         returned.wait()
         by_token = got2.permute(1, 2, 3, 0, 4).reshape(k, 3, m, D)
     if skip:  # the skipped blocks' queries, keys and values get no credit
@@ -791,8 +798,8 @@ def main():
     root = Path(__file__).resolve().parents[2]
     dist.init_process_group('nccl')
     rank, world = dist.get_rank(), dist.get_world_size()
-    if world != H:
-        raise SystemExit(f'one head per GPU: run on {H} GPUs, not {world}')
+    if world not in (1, H):
+        raise SystemExit(f'one head per GPU: run on {H} GPUs (or every head on one), not {world}')
     device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', rank)))
     torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = True
