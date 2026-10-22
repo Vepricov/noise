@@ -797,9 +797,6 @@ MODEL = None
 def main():
     global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP, ALTERNATE, SKIP_MOVE
     global SKIP_FROM, SKIP_BLOCKS, SKIP_ODD, ANVIL_MAPS
-    SKIP_FROM, ANVIL_MAPS = args.skip_from, ANVIL_MAPS[:args.polar_iters]
-    SKIP_BLOCKS = tuple(int(b) for b in args.skip_blocks.split(','))
-    SKIP_ODD = tuple(i for i in range(L) if i not in SKIP_BLOCKS)
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
@@ -819,6 +816,9 @@ def main():
     parser.add_argument('--skip', choices=('late', 'alternate', 'none'), default='late',
                         help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
     args = parser.parse_args()
+    SKIP_FROM, ANVIL_MAPS = args.skip_from, ANVIL_MAPS[:args.polar_iters]
+    SKIP_BLOCKS = tuple(int(b) for b in args.skip_blocks.split(','))
+    SKIP_ODD = tuple(i for i in range(L) if i not in SKIP_BLOCKS)
     STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates // 2, args.updates * 2 // 5, args.seed
     START, EMA, SKIP = args.init == 'prev8', args.ema == 'fixed', args.skip == 'late'
     root = Path(__file__).resolve().parents[2]
