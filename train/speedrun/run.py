@@ -163,6 +163,9 @@ class Tricks:
     batch matches the predicted <g, delta> and shrinks when it does not (a trust region per block).
     storm: STORM momentum; the estimate is retaken at the previous weights with the same batch and draws and
     m = g + (1 - a) (m_prev - g_prev) replaces the raw estimate.
+    cv_every: control variate. Every step takes the cheap stagewise (Boost) estimate g0 on its batch; every k-th
+    step also takes the Cut estimate gC and moves the correction D <- (1 - cv_beta) D + cv_beta (gC - g0). A Cut step
+    updates with gC, any other with g0 + D. Logs cos(gC, g0) and cos(gC, g0 + D) on Cut steps.
     """
     probe_rank: int = 0
     probe_explore: int = 0
@@ -174,6 +177,8 @@ class Tricks:
     trust_min: float = 0.25
     trust_max: float = 2.0
     storm: float = 0.0
+    cv_every: int = 0
+    cv_beta: float = 0.5
     profile: bool = False
 
 
@@ -805,6 +810,7 @@ class Boost:
         self.tricks, self.diag = Tricks(), {}
         self.subspaces, self.covariances, self.cut_calls = {}, {}, 0
         self.trust_mult, self.storm_m, self.storm_w = None, None, None
+        self.cv_d, self.cv_calls = None, 0
 
     def close(self):
         self.capture.close()
@@ -1173,6 +1179,29 @@ class Boost:
         return gradients
 
     @torch.no_grad()
+    def control_variate(self, x, y):
+        """g0 + D on most steps, gC (and a move of D toward gC - g0) on every cv_every-th; see Tricks."""
+        t = self.tricks
+        cheap = Boost.estimate(self, x, y)
+        measure = self.cv_calls % t.cv_every == 0
+        self.cv_calls += 1
+        if not measure:
+            return {n: g + self.cv_d[n] for n, g in cheap.items()}
+        exact = self.estimate(x, y)
+        names = list(exact)
+        flat = lambda gs: torch.cat([gs[n].float().reshape(-1) for n in names])
+        e, c = flat(exact), flat(cheap)
+        self.diag['cv_cos_cheap'] = round(F.cosine_similarity(e, c, dim=0).item(), 4)
+        if self.cv_d is not None:
+            self.diag['cv_cos_pred'] = round(F.cosine_similarity(e, c + flat(self.cv_d), dim=0).item(), 4)
+        del e, c
+        diff = {n: exact[n] - cheap[n] for n in names}
+        self.cv_d = diff if self.cv_d is None else {n: (1 - t.cv_beta) * self.cv_d[n] + t.cv_beta * diff[n]
+                                                    for n in names}
+        self.diag['cv_measured'] = 1
+        return exact
+
+    @torch.no_grad()
     def batch_loss(self, x, y):
         with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
             return self.model(x, y).float()
@@ -1218,7 +1247,7 @@ class Boost:
         self.diag = {}
         cut, t = isinstance(self, Cut), self.tricks
         state = self.random_state() if cut and t.storm else None
-        gradients = self.estimate(x, y)
+        gradients = self.control_variate(x, y) if cut and t.cv_every else self.estimate(x, y)
         loss = average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
         if state is not None:
             gradients = self.storm_correct(x, y, gradients, state)
@@ -2791,6 +2820,8 @@ def main():
     parser.add_argument('--probe-beta', type=float, default=0.9)
     parser.add_argument('--trust', action='store_true')
     parser.add_argument('--storm', type=float, default=0.0)
+    parser.add_argument('--cv-every', type=int, default=0)
+    parser.add_argument('--cv-beta', type=float, default=0.5)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2812,7 +2843,7 @@ def main():
     try:
         tricks = Tricks(probe_rank=args.probe_rank, probe_explore=args.probe_explore,
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
-                        storm=args.storm, profile=args.profile)
+                        storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
