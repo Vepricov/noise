@@ -168,6 +168,8 @@ class Tricks:
     updates with gC, any other with g0 + D. Logs cos(gC, g0) and cos(gC, g0 + D) on Cut steps.
     future_draws, key_path_draws, query_keys: Cut probe budgets in place of the recipe's (-1 keeps it); partial
     cycles, so fewer forwards per step at the cost of noisier credit. Kept here so a run resumes from the record.
+    chain_rows: each chain root moves along r rows of the Hadamard cycle drawn afresh every step, read back with
+    weight d / r (unbiased), instead of all d rows.
     """
     probe_rank: int = 0
     probe_explore: int = 0
@@ -184,6 +186,7 @@ class Tricks:
     future_draws: int = -1
     key_path_draws: int = -1
     query_keys: int = -1
+    chain_rows: int = 0
     profile: bool = False
 
 
@@ -1517,6 +1520,12 @@ class Cut(Boost):
         """The step's full cycle, or this root's subspace plus random complement directions (rows of norm sqrt(d), as
         the cycle's) with the weights that read the complement back unbiased."""
         H = self.basis()
+        if self.tricks.chain_rows and not self.tricks.probe_rank:
+            d, r = self.width, self.tricks.chain_rows
+            rows = torch.randperm(d, device=self.device, generator=self.generator)[:r]
+            per = r // self.split
+            rows = rows[self.part * per:(self.part + 1) * per]
+            return H[rows].contiguous(), torch.full((per,), d / r, device=self.device)
         if full or site not in self.subspaces:
             lo, hi = self.share(self.width)
             return H[lo:hi], None
@@ -2832,6 +2841,7 @@ def main():
     parser.add_argument('--future-draws', type=int, default=-1)
     parser.add_argument('--key-path-draws', type=int, default=-1)
     parser.add_argument('--query-keys', type=int, default=-1)
+    parser.add_argument('--chain-rows', type=int, default=0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2855,7 +2865,7 @@ def main():
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
                         storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta,
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
-                        query_keys=args.query_keys, profile=args.profile)
+                        query_keys=args.query_keys, chain_rows=args.chain_rows, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
