@@ -152,6 +152,31 @@ class Settings:
         return torch.bfloat16 if self.chain_precision == 'bf16' else torch.float32
 
 
+@dataclass(frozen=True)
+class Tricks:
+    """Optimizer-side additions, kept out of the recipe so a run can resume from a checkpoint of the record.
+
+    probe_rank, probe_explore: each Cut root moves along its credit's top-r directions (an exponential mean of the
+    credit covariance) plus s random directions of the complement, read back with weight (d - r) / s, instead of a
+    full cycle of d. probe_full_every: a full cycle every k Cut steps, which also logs the energy the subspace held.
+    trust: each block's step is scaled by a multiplier that grows when the step's realised loss change on its own
+    batch matches the predicted <g, delta> and shrinks when it does not (a trust region per block).
+    storm: STORM momentum; the estimate is retaken at the previous weights with the same batch and draws and
+    m = g + (1 - a) (m_prev - g_prev) replaces the raw estimate.
+    """
+    probe_rank: int = 0
+    probe_explore: int = 0
+    probe_full_every: int = 50
+    probe_beta: float = 0.9
+    trust: bool = False
+    trust_up: float = 1.1
+    trust_down: float = 0.8
+    trust_min: float = 0.25
+    trust_max: float = 2.0
+    storm: float = 0.0
+    profile: bool = False
+
+
 # ---------------------------------------------------------------------------------------------------------- helpers
 
 
@@ -777,6 +802,9 @@ class Boost:
         self.shared_generator = self.capture.shared_generator
         self.generator = torch.Generator(self.device).manual_seed(seed + 17 + 1000 * sequence)
         self.maps = {}
+        self.tricks, self.diag = Tricks(), {}
+        self.subspaces, self.covariances, self.cut_calls = {}, {}, 0
+        self.trust_mult, self.storm_m, self.storm_w = None, None, None
 
     def close(self):
         self.capture.close()
@@ -1117,8 +1145,83 @@ class Boost:
                 gradients[name] = torch.zeros_like(p, dtype=torch.float32)
         return gradients
 
+    def random_state(self):
+        """Everything that fixes the step's draws: the generators and the probe subspaces."""
+        return ([g.get_state() for g in (self.generator, self.shared_generator, self.capture.generator)]
+                + [torch.cuda.get_rng_state(self.device), dict(self.subspaces), dict(self.covariances), self.cut_calls])
+
+    def set_random_state(self, state):
+        for g, st in zip((self.generator, self.shared_generator, self.capture.generator), state):
+            g.set_state(st)
+        torch.cuda.set_rng_state(state[3], self.device)
+        self.subspaces, self.covariances, self.cut_calls = dict(state[4]), dict(state[5]), state[6]
+
+    @torch.no_grad()
+    def storm_correct(self, x, y, gradients, state):
+        """m = g(w) + (1 - a) (m_prev - g(w_prev)), both estimates on this batch with the same draws."""
+        a, params = self.tricks.storm, list(self.model.parameters())
+        if self.storm_m is not None:
+            current = [q.detach().clone() for q in params]
+            torch._foreach_copy_(params, self.storm_w)
+            after = self.random_state()
+            self.set_random_state(state)
+            previous = self.estimate(x, y)
+            self.set_random_state(after)
+            torch._foreach_copy_(params, current)
+            gradients = {n: g + (1 - a) * (self.storm_m[n] - previous[n]) for n, g in gradients.items()}
+        self.storm_m = gradients
+        return gradients
+
+    @torch.no_grad()
+    def batch_loss(self, x, y):
+        with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
+            return self.model(x, y).float()
+
+    @torch.no_grad()
+    def trust_scale(self, x, y, params, old):
+        """Scale each block's step by its multiplier, then move the multiplier by the block's ratio of realised to
+        predicted loss change, both on this batch (one forward per block and one at the old weights)."""
+        t, L = self.tricks, self.model.config.n_layer
+        if self.trust_mult is None:
+            self.trust_mult = torch.ones(L, device=self.device)
+        new = [p.detach().clone() for _, p in params]
+        blocks = [[j for j, (n, _) in enumerate(params) if n.startswith(f'transformer.h.{i}.')] for i in range(L)]
+        values = torch.zeros(2 * L + 1, device=self.device)
+        for (_, p), w in zip(params, old):
+            p.copy_(w)
+        values[2 * L] = self.batch_loss(x, y)
+        for i, idx in enumerate(blocks):
+            for j in idx:
+                params[j][1].copy_(new[j])
+            values[i] = self.batch_loss(x, y)
+            for j in idx:
+                params[j][1].copy_(old[j])
+            values[L + i] = sum((params[j][1].grad.float() * (new[j].float() - old[j].float())).sum() for j in idx)
+        values = average_ranks(values)
+        realised, predicted = values[:L] - values[2 * L], values[L:2 * L]
+        rho = realised / predicted.where(predicted.abs() > 1e-12, torch.full_like(predicted, -1e-12))
+        grow = (predicted < 0) & (rho > 0.75)
+        shrink = (predicted >= 0) | (rho < 0.25)
+        factor = torch.where(grow, t.trust_up, torch.where(shrink, t.trust_down, 1.0))
+        mult = self.trust_mult
+        for i, idx in enumerate(blocks):
+            for j in idx:
+                params[j][1].copy_(old[j] + mult[i] * (new[j] - old[j]))
+        for (_, p), w, j in zip(params, new, range(len(params))):
+            if not any(j in idx for idx in blocks):
+                p.copy_(w)
+        self.trust_mult = (mult * factor).clamp(t.trust_min, t.trust_max)
+        self.diag['trust_rho'] = [round(v, 3) for v in rho.tolist()]
+        self.diag['trust_mult'] = [round(v, 3) for v in mult.tolist()]
+
     def step(self, x, y, optimizer):
+        self.diag = {}
+        cut, t = isinstance(self, Cut), self.tricks
+        state = self.random_state() if cut and t.storm else None
         gradients = self.estimate(x, y)
+        loss = average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
+        if state is not None:
+            gradients = self.storm_correct(x, y, gradients, state)
         valid = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
         sequences = self.world // self.split
@@ -1133,9 +1236,14 @@ class Boost:
         for name, p in params:
             p.grad = flat[offset:offset + p.numel()].view_as(p).to(p.dtype)
             offset += p.numel()
+        old = [p.detach().clone() for _, p in params] if cut and (t.trust or t.storm) else None
         optimizer.step()
+        if cut and t.trust:
+            self.trust_scale(x, y, params, old)
+        if cut and t.storm:
+            self.storm_w = old
         self.maps.clear()
-        return average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
+        return loss
 
 class Cut(Boost):
     """Own-query forward loss probes, optionally augmented by PR #23's value path."""
@@ -1305,13 +1413,14 @@ class Cut(Boost):
         probes = []
         lo, hi = self.share(self.width)  # this GPU's share of each cycle; the scalar moves on the first GPU
         P, scalars_here = hi - lo, self.part == 0
+        full = self.full_cycle()
         for site in range(-1, L):
-            H = self.basis()[lo:hi]
+            H, weights = self.site_directions(site, full)
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             credit = torch.empty(n, self.width, device=self.device)
             lam = torch.zeros(2, device=self.device)
-            probes.append((site, H, steps, credit, lam))
+            probes.append((site, H, weights, steps, credit, lam))
         length = self.capture.length if s.own_query else n
         for start in range(0, n, length):
             own = None
@@ -1336,7 +1445,8 @@ class Cut(Boost):
                 # not again for each of the 44 layer visits of the nine roots.
                 selected_fc = [w[r[0][sl]] for w, r in zip(w_fc, routes)]
                 selected_out = [w[r[0][sl]] for w, r in zip(w_out_t, routes)]
-                for site, H, steps, credit, lam in probes:
+                for site, H, weights, steps, credit, lam in probes:
+                    P = H.shape[0]
                     move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
                     scale = steps[sl].expand(-1, P)
                     if site >= 0 and scalars_here:  # symmetric probes of both linear mixing scalars
@@ -1349,7 +1459,7 @@ class Cut(Boost):
                         site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                         [r[1][sl] for r in routes], lam_r, lam_0, selected_fc, selected_out, weight_t,
                         base[sl], target_w[sl], y[sl], own_sl, packed=True)
-                    credit[sl] = derivative[:, :P] @ H / self.width
+                    credit[sl] = (derivative[:, :P] if weights is None else derivative[:, :P] * weights) @ H / self.width
                     if site >= 0 and scalars_here:
                         lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
                 del selected_fc, selected_out
@@ -1357,11 +1467,55 @@ class Cut(Boost):
             # next sequence's routed keys and values.
             del own_sl, own
         credits = {}
-        for site, _, _, credit, lam in probes:
+        for site, _, _, _, credit, lam in probes:
             credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
                 credits['lam', site] = self.group_sum(lam)
+        self.update_subspaces(credits, full)
         return credits
+
+    def full_cycle(self):
+        t = self.tricks
+        self.cut_calls += 1
+        return not t.probe_rank or not self.subspaces or (self.cut_calls - 1) % t.probe_full_every == 0
+
+    def site_directions(self, site, full):
+        """The step's full cycle, or this root's subspace plus random complement directions (rows of norm sqrt(d), as
+        the cycle's) with the weights that read the complement back unbiased."""
+        H = self.basis()
+        if full or site not in self.subspaces:
+            lo, hi = self.share(self.width)
+            return H[lo:hi], None
+        d, U, k = self.width, self.subspaces[site], self.tricks.probe_explore
+        r = U.shape[0]
+        Q = torch.randn(d, k, device=self.device, generator=self.generator)
+        Q = torch.linalg.qr(Q - U.T @ (U @ Q)).Q.T
+        D = torch.cat([U, Q]) * d ** 0.5
+        w = torch.cat([torch.ones(r, device=self.device), torch.full((k,), (d - r) / k, device=self.device)])
+        per = (r + k) // self.split
+        return D[self.part * per:(self.part + 1) * per].contiguous(), w[self.part * per:(self.part + 1) * per]
+
+    def update_subspaces(self, credits, full):
+        """Exponential mean of each root's credit covariance (trace-normalised) and its top-r eigenvectors. Between full
+        cycles the complement part enters at sqrt(k / (d - r)) of its unbiased read-back."""
+        t, d = self.tricks, self.width
+        if not t.probe_rank:
+            return
+        for key, c in credits.items():
+            if isinstance(key, tuple):
+                continue
+            c, U = c.float(), self.subspaces.get(key)
+            if U is not None:
+                inside = (c @ U.T) @ U
+                if full:
+                    self.diag[f'held_{key}'] = round((inside.square().sum() / c.square().sum().clamp_min(1e-30)).item(), 4)
+                else:
+                    c = inside + (c - inside) * (t.probe_explore / (d - t.probe_rank)) ** 0.5
+            cov = c.T @ c
+            cov = cov / cov.diagonal().sum().clamp_min(1e-30)
+            old = self.covariances.get(key)
+            self.covariances[key] = cov if old is None else old.lerp(cov, 1 - t.probe_beta)
+            self.subspaces[key] = torch.linalg.eigh(self.covariances[key]).eigenvectors[:, -t.probe_rank:].T.contiguous()
 
     def own_query_inputs(self, sequence=0):
         """Clean keys/values for one sequence; preserve upstream math and token positions."""
@@ -1443,6 +1597,7 @@ class Cut(Boost):
         self.maps.clear()
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
+        clock = self.tick('', None)
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1463,7 +1618,9 @@ class Cut(Boost):
             top = self.select_mlp_routes(i, mid, hpre, r)
             mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
         g_top = self.probe(outs[-1], yf)  # the top stream's credit, through the head alone
+        clock = self.tick('setup', clock)
         chain = self.chain_credits(e, x0, mids, outs, routes, yf)
+        clock = self.tick('chain', clock)
         lam_r = model.resid_lambdas.float()
         targets = {i: (chain[i] @ block.attn.c_proj.weight.float()).view(b, t, self.width)
                    for i, block in enumerate(model.transformer.h)}
@@ -1471,6 +1628,7 @@ class Cut(Boost):
         # Corrected targets still take a separate A.T @ target in exact_values.
         raw_values = {i: self.value_credit(i, target) for i, target in targets.items()}
         extra, inputs = self.path_credits(chain, targets, raw_values) if s.value_path or s.key_path_draws or s.gate_path else (None, None)
+        clock = self.tick('path', clock)
         value_targets = {}
         scalars = torch.zeros(2, L, device=self.device)
         for i in range(L):
@@ -1494,7 +1652,9 @@ class Cut(Boost):
         if s.path_scalars and extra is not None:
             scalars += self.path_scalar_credit(inputs, extra, x0, outs)
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
+        clock = self.tick('local', clock)
         self.internals(gradients, targets, b, t, value_targets or None, self._input_key_errors, raw_values)
+        clock = self.tick('internals', clock)
         self._input_key_errors = None
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, self.width))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
@@ -1511,7 +1671,18 @@ class Cut(Boost):
             # Use this capture's original measured hub targets, never corrected
             # targets. Only the source parameter gradients receive the addition.
             add_future_gradients(self, gradients)
+        self.tick('future', clock)
         return gradients
+
+    def tick(self, name, since):
+        """Seconds per part of the estimate, summed into the step's diagnostics when profiling."""
+        if not self.tricks.profile:
+            return None
+        torch.cuda.synchronize(self.device)
+        now = time.perf_counter()
+        if since is not None:
+            self.diag['t_' + name] = round(self.diag.get('t_' + name, 0.0) + now - since, 3)
+        return now
 
 
 # -------------------------------------------------------------------------------------------------- future probes
@@ -2441,7 +2612,7 @@ def end_merge(model, means, rows, rank, world):
     return joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain, load)
 
 
-def train_stages(args, settings, device, rank, world):
+def train_stages(args, settings, device, rank, world, tricks=Tricks()):
     """Boost -> own-query Cut; each row is consumed exactly once, including across resume."""
     if world not in (1, 2, 4, 8):
         raise ValueError('Stage training supports 1, 2, 4 or 8 GPUs')
@@ -2474,12 +2645,17 @@ def train_stages(args, settings, device, rank, world):
                        'independent_future_hidden_query_embedding_probes', 'cut_batch4_split2', 'recipe_11',
                        'end_merge'],
             resume=str(args.resume.resolve()) if args.resume else None, torch_version=torch.__version__,
+            tricks=asdict(tricks),
         ), indent=2)+'\n')
 
     def estimator_for(model, phase):
         if phase == 'boost':
             return Boost(model, settings, SEED, rank, world, split, group)
-        return Cut(model, settings, SEED, rank, world, cut_split, cut_group)
+        estimator = Cut(model, settings, SEED, rank, world, cut_split, cut_group)
+        if (tricks.probe_rank + tricks.probe_explore) % cut_split or (tricks.probe_rank and not tricks.probe_explore):
+            raise ValueError('Subspace probes need explore directions and r + s divisible across the sequence group')
+        estimator.tricks = tricks
+        return estimator
 
     def rank_slice(batch, phase):
         group_size = split if phase == 'boost' else cut_split
@@ -2538,7 +2714,7 @@ def train_stages(args, settings, device, rank, world):
             elapsed = previous_seconds + time.perf_counter()-start-paused
             record = dict(step=step, phase=phase, phase_step=phase_step, seqs=end,
                           tokens=end*settings.model.sequence_len, train_loss=loss, train_seconds=round(elapsed, 2),
-                          peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3))
+                          peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3), **estimator.diag)
             if args.eval_every and step % args.eval_every == 0 and step < steps:
                 pause = time.perf_counter()
                 record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
@@ -2608,6 +2784,15 @@ def main():
     parser.add_argument('--key-path-tokens', type=int, default=64)
     parser.add_argument('--future-tokens', type=int, default=128)
     parser.add_argument('--future-chunk', type=int, default=512)
+    # Optimizer-side additions (Tricks); all off reproduces the record.
+    parser.add_argument('--probe-rank', type=int, default=0)
+    parser.add_argument('--probe-explore', type=int, default=0)
+    parser.add_argument('--probe-full-every', type=int, default=50)
+    parser.add_argument('--probe-beta', type=float, default=0.9)
+    parser.add_argument('--trust', action='store_true')
+    parser.add_argument('--storm', type=float, default=0.0)
+    parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
     for key in ('steps', 'stop_after_step'):
         if getattr(args, key) is not None and getattr(args, key) < 1:
@@ -2616,7 +2801,7 @@ def main():
         parser.error('Logging intervals must be nonnegative')
     settings = Settings(chain_tokens=args.chain_tokens, key_chunk=args.key_chunk,
                         key_path_tokens=args.key_path_tokens, future_tokens=args.future_tokens,
-                        future_chunk=args.future_chunk)
+                        future_chunk=args.future_chunk, switch=args.switch)
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
     device = torch.device('cuda', torch.cuda.current_device())
@@ -2625,7 +2810,10 @@ def main():
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
     try:
-        train_stages(args, settings, device, rank, world)
+        tricks = Tricks(probe_rank=args.probe_rank, probe_explore=args.probe_explore,
+                        probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
+                        storm=args.storm, profile=args.profile)
+        train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
             torch.distributed.destroy_process_group()
