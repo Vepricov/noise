@@ -28,7 +28,7 @@ No receiver sampling or active-space direction encoding is used.
     uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 """
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import cache, partial
 from math import gcd
 import json
@@ -166,6 +166,8 @@ class Tricks:
     cv_every: control variate. Every step takes the cheap stagewise (Boost) estimate g0 on its batch; every k-th
     step also takes the Cut estimate gC and moves the correction D <- (1 - cv_beta) D + cv_beta (gC - g0). A Cut step
     updates with gC, any other with g0 + D. Logs cos(gC, g0) and cos(gC, g0 + D) on Cut steps.
+    future_draws, key_path_draws, query_keys: Cut probe budgets in place of the recipe's (-1 keeps it); partial
+    cycles, so fewer forwards per step at the cost of noisier credit. Kept here so a run resumes from the record.
     """
     probe_rank: int = 0
     probe_explore: int = 0
@@ -179,6 +181,9 @@ class Tricks:
     storm: float = 0.0
     cv_every: int = 0
     cv_beta: float = 0.5
+    future_draws: int = -1
+    key_path_draws: int = -1
+    query_keys: int = -1
     profile: bool = False
 
 
@@ -2684,6 +2689,8 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
         if (tricks.probe_rank + tricks.probe_explore) % cut_split or (tricks.probe_rank and not tricks.probe_explore):
             raise ValueError('Subspace probes need explore directions and r + s divisible across the sequence group')
         estimator.tricks = tricks
+        budgets = {k: getattr(tricks, k) for k in ('future_draws', 'key_path_draws', 'query_keys')}
+        estimator.s = replace(settings, **{k: v for k, v in budgets.items() if v >= 0})
         return estimator
 
     def rank_slice(batch, phase):
@@ -2822,6 +2829,9 @@ def main():
     parser.add_argument('--storm', type=float, default=0.0)
     parser.add_argument('--cv-every', type=int, default=0)
     parser.add_argument('--cv-beta', type=float, default=0.5)
+    parser.add_argument('--future-draws', type=int, default=-1)
+    parser.add_argument('--key-path-draws', type=int, default=-1)
+    parser.add_argument('--query-keys', type=int, default=-1)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2843,7 +2853,9 @@ def main():
     try:
         tricks = Tricks(probe_rank=args.probe_rank, probe_explore=args.probe_explore,
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
-                        storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta, profile=args.profile)
+                        storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta,
+                        future_draws=args.future_draws, key_path_draws=args.key_path_draws,
+                        query_keys=args.query_keys, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
