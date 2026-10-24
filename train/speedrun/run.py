@@ -170,6 +170,10 @@ class Tricks:
     cycles, so fewer forwards per step at the cost of noisier credit. Kept here so a run resumes from the record.
     chain_rows: each chain root moves along r rows of the Hadamard cycle drawn afresh every step, read back with
     weight d / r (unbiased), instead of all d rows.
+    future_learned: ZORL (learned direction sampling) on the future probes. Each source keeps r learned orthonormal
+    directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
+    the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
+    credit's leading directions by an Oja step of size future_learned_lr. Logs the share of credit energy U held.
     """
     probe_rank: int = 0
     probe_explore: int = 0
@@ -187,6 +191,8 @@ class Tricks:
     key_path_draws: int = -1
     query_keys: int = -1
     chain_rows: int = 0
+    future_learned: int = 0
+    future_learned_lr: float = 0.1
     profile: bool = False
 
 
@@ -2121,6 +2127,7 @@ class FiniteFuture:
                 for j in range(layer+1, len(self.contexts)):
                     coeff = coeff*lam[j]
                     receivers.append((j, coeff))
+            basis = self.learned_basis(name, width, raw.device, gen)
             for t0 in range(0, t, self.tokens):
                 sl = slice(t0, min(t0+self.tokens, t))
                 trial = self.experiment(family, layer, raw, sl, receivers, t0)
@@ -2135,6 +2142,13 @@ class FiniteFuture:
                             credits[budgets[0]][sl] = accumulator/budgets[0]
                     elif p1 in credits:
                         credits[p1][sl] = accumulator/p1
+                if basis is not None:  # learned rows have the Hadamard rows' norm, so trial returns width U U^T g
+                    exact = trial((basis*width**.5).expand(sl.stop-t0, -1, -1).contiguous(), steps[sl])/width
+                    for p in budgets:
+                        c = credits[p][sl]
+                        credits[p][sl] = exact+c-(c @ basis.T) @ basis
+            if basis is not None:
+                self.learn_basis(name, basis, credits[budgets[-1]])
             for p in budgets:
                 result[p][name] = credits[p][None]
             if self.timing and d.x.is_cuda:
@@ -2142,6 +2156,29 @@ class FiniteFuture:
             timings[name] = time.perf_counter()-start
         self.timings = timings
         return result
+
+    def learned_basis(self, name, width, device, gen):
+        e = self.e
+        r = getattr(getattr(e, 'tricks', None), 'future_learned', 0)
+        if not r:
+            return None
+        if getattr(e, 'split', 1) > 1:
+            raise ValueError('Learned future directions need one GPU per sequence')
+        bases = e.__dict__.setdefault('future_basis', {})
+        if name not in bases:
+            start = torch.randn(width, r, device=device, generator=gen)
+            bases[name] = torch.linalg.qr(start).Q.T.contiguous()
+        return bases[name]
+
+    def learn_basis(self, name, basis, credit):
+        """Oja step toward the credit's leading directions; logs the energy share the old basis held."""
+        e, lr = self.e, self.e.tricks.future_learned_lr
+        projected = credit @ basis.T
+        held = (projected.square().sum()/credit.square().sum().clamp_min(1e-30)).item()
+        e.diag['future_held'] = round(e.diag.get('future_held', 0.0)+held/self.future_sites, 4)
+        pull = projected.T @ credit
+        pull = pull/pull.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        e.future_basis[name] = torch.linalg.qr(((1-lr)*basis+lr*pull).T).Q.T.contiguous()
 
 
 @torch.no_grad()
@@ -2159,6 +2196,7 @@ def add_future_gradients(estimator, gradients):
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
                           query_mlp=True, timing=False)
+    future.future_sites = (2*s.future_layers+1)*d.batch
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
@@ -2842,6 +2880,8 @@ def main():
     parser.add_argument('--key-path-draws', type=int, default=-1)
     parser.add_argument('--query-keys', type=int, default=-1)
     parser.add_argument('--chain-rows', type=int, default=0)
+    parser.add_argument('--future-learned', type=int, default=0)
+    parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2865,7 +2905,8 @@ def main():
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
                         storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta,
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
-                        query_keys=args.query_keys, chain_rows=args.chain_rows, profile=args.profile)
+                        query_keys=args.query_keys, chain_rows=args.chain_rows, future_learned=args.future_learned,
+                        future_learned_lr=args.future_learned_lr, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
