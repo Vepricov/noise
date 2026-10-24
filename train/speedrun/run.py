@@ -170,6 +170,11 @@ class Tricks:
     cycles, so fewer forwards per step at the cost of noisier credit. Kept here so a run resumes from the record.
     chain_rows: each chain root moves along r rows of the Hadamard cycle drawn afresh every step, read back with
     weight d / r (unbiased), instead of all d rows.
+    jaguar: with chain_rows, a JAGUAR buffer for the stream-writing weights (attn.c_proj, mlp.c_proj). Each step
+    measures the chain credit along r of the d rows only; the buffer M keeps every weight's last estimate and takes
+    the new one along the measured rows, M <- M - (1 - b) P_S M + (1 - b) (r / d) G_S, where P_S projects onto the
+    step's rows and (r / d) G_S is the unbiased chain gradient read back at weight 1. b is jaguar_beta (0 replaces).
+    The path credit added to those weights stays fresh; other weights keep the unbiased partial estimate.
     future_learned: ZORL (learned direction sampling) on the future probes. Each source keeps r learned orthonormal
     directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
     the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
@@ -191,6 +196,8 @@ class Tricks:
     key_path_draws: int = -1
     query_keys: int = -1
     chain_rows: int = 0
+    jaguar: bool = False
+    jaguar_beta: float = 0.0
     future_learned: int = 0
     future_learned_lr: float = 0.1
     profile: bool = False
@@ -1517,6 +1524,28 @@ class Cut(Boost):
         self.update_subspaces(credits, full)
         return credits
 
+    @torch.no_grad()
+    def jaguar_update(self, gradients, chain, lam_r):
+        """Swap the partial chain part of each stream-writing weight's gradient for the JAGUAR buffer (Tricks.jaguar)."""
+        t, d, L = self.tricks, self.width, self.model.config.n_layer
+        if not t.chain_rows or t.probe_rank or self.split > 1:
+            raise ValueError('JAGUAR needs chain_rows, no probe subspace and one GPU per sequence')
+        buffers = self.__dict__.setdefault('jaguar_buffers', {})
+        for i in range(L):
+            p = f'transformer.h.{i}.'
+            for name, key, scale in ((p + 'attn.c_proj', i, 1.0), (p + 'mlp.c_proj', i + 1, None)):
+                if key >= L:
+                    continue  # the top block's mlp.c_proj takes g_top, a full measurement
+                rows = self.jaguar_rows[key]
+                credit = chain[key] if scale is not None else lam_r[key] * chain[key]
+                partial = credit.T @ self.capture.inputs[name].flatten(0, 1).float()
+                M = buffers.get(name)
+                if M is None:
+                    M = buffers[name] = torch.zeros_like(partial)
+                M -= (1 - t.jaguar_beta) * (rows.T @ (rows @ M) / d)
+                M += (1 - t.jaguar_beta) * (rows.shape[0] / d) * partial
+                gradients[name + '.weight'] = gradients[name + '.weight'] - partial + M
+
     def full_cycle(self):
         t = self.tricks
         self.cut_calls += 1
@@ -1531,6 +1560,8 @@ class Cut(Boost):
             rows = torch.randperm(d, device=self.device, generator=self.generator)[:r]
             per = r // self.split
             rows = rows[self.part * per:(self.part + 1) * per]
+            if self.tricks.jaguar:
+                self.__dict__.setdefault('jaguar_rows', {})['emb' if site < 0 else site] = H[rows]
             return H[rows].contiguous(), torch.full((per,), d / r, device=self.device)
         if full or site not in self.subspaces:
             lo, hi = self.share(self.width)
@@ -1700,6 +1731,8 @@ class Cut(Boost):
             scalars[:, i] = chain['lam', i]
         if s.path_scalars and extra is not None:
             scalars += self.path_scalar_credit(inputs, extra, x0, outs)
+        if self.tricks.jaguar:
+            self.jaguar_update(gradients, chain, lam_r)
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         clock = self.tick('local', clock)
         self.internals(gradients, targets, b, t, value_targets or None, self._input_key_errors, raw_values)
@@ -2882,6 +2915,8 @@ def main():
     parser.add_argument('--key-path-draws', type=int, default=-1)
     parser.add_argument('--query-keys', type=int, default=-1)
     parser.add_argument('--chain-rows', type=int, default=0)
+    parser.add_argument('--jaguar', action='store_true')
+    parser.add_argument('--jaguar-beta', type=float, default=0.0)
     parser.add_argument('--future-learned', type=int, default=0)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--profile', action='store_true')
@@ -2907,7 +2942,8 @@ def main():
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
                         storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta,
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
-                        query_keys=args.query_keys, chain_rows=args.chain_rows, future_learned=args.future_learned,
+                        query_keys=args.query_keys, chain_rows=args.chain_rows, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
+                        future_learned=args.future_learned,
                         future_learned_lr=args.future_learned_lr, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
