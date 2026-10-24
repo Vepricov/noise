@@ -2175,7 +2175,8 @@ class FiniteFuture:
         e, lr = self.e, self.e.tricks.future_learned_lr
         projected = credit @ basis.T
         held = (projected.square().sum()/credit.square().sum().clamp_min(1e-30)).item()
-        e.diag['future_held'] = round(e.diag.get('future_held', 0.0)+held/self.future_sites, 4)
+        e.future_held_sum = getattr(e, 'future_held_sum', 0.0)+held/self.future_sites
+        e.diag['future_held'] = round(e.future_held_sum, 4)
         pull = projected.T @ credit
         pull = pull/pull.norm(dim=1, keepdim=True).clamp_min(1e-30)
         e.future_basis[name] = torch.linalg.qr(((1-lr)*basis+lr*pull).T).Q.T.contiguous()
@@ -2197,6 +2198,7 @@ def add_future_gradients(estimator, gradients):
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
                           query_mlp=True, timing=False)
     future.future_sites = (2*s.future_layers+1)*d.batch
+    e.future_held_sum = 0.0
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
