@@ -228,6 +228,7 @@ class Tricks:
     zo_beta: float = 0.0
     zo_act_rank: int = 0
     zo_adaptive: bool = False
+    zo_scale: float = 1.0
     zo_history: int = 0
     profile: bool = False
 
@@ -1336,7 +1337,7 @@ class Boost:
                 b.lerp_(c, 1 - t.zo_beta)
             correction = buf
         for p, c in zip(scope, correction):
-            p.grad = (p.grad.float() + c).to(p.dtype)
+            p.grad = (p.grad.float() + t.zo_scale * c).to(p.dtype)
         a = torch.tensor(ratios)
         self.diag['zo_along_rms'] = round(a[:, 0].square().mean().sqrt().item(), 5)
         self.diag['zo_cut_rms'] = round(a[:, 1].square().mean().sqrt().item(), 5)
@@ -1394,7 +1395,7 @@ class Boost:
             st['threshold'] = 0.9 * st['threshold'] + 0.1 * score
         st['history'] = (st['history'] + fresh)[-t.zo_history:] if t.zo_history else []
         for p, c in zip(scope, correction):
-            p.grad = (p.grad.float() + c).to(p.dtype)
+            p.grad = (p.grad.float() + t.zo_scale * c).to(p.dtype)
         a = torch.tensor(ratios)
         self.diag['zo_fresh'] = len(fresh)
         self.diag['zo_score'] = None if score is None else round(score, 4)
@@ -3142,6 +3143,7 @@ def main():
     parser.add_argument('--zo-act-rank', type=int, default=0)
     parser.add_argument('--zo-adaptive', action='store_true')
     parser.add_argument('--zo-history', type=int, default=0)
+    parser.add_argument('--zo-scale', type=float, default=1.0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -3167,7 +3169,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
