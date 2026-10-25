@@ -192,6 +192,7 @@ class Tricks:
     draws the directions in the span of the top r input directions of each matrix (StructZO, AIM-ZO). zo_adaptive
     (ZoAQ) reuses the last zo_history probe answers and takes 2..zo_probes fresh ones by momentum agreement. zo_beta
     keeps an exponential mean of the correction across steps (a JAGUAR-style buffer).
+    route_k: MLP neurons each chain probe moves through in place of the recipe's 512 (-1 keeps it).
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
     an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
@@ -222,6 +223,7 @@ class Tricks:
     probe_memory: int = 0
     probe_sampled: int = 0
     no_paths: bool = False
+    route_k: int = -1
     zo_probes: int = 0
     zo_scope: str = 'attn'
     zo_tau: float = 1e-3
@@ -2981,7 +2983,7 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
         if (tricks.probe_rank + tricks.probe_explore) % cut_split or (tricks.probe_rank and not tricks.probe_explore):
             raise ValueError('Subspace probes need explore directions and r + s divisible across the sequence group')
         estimator.tricks = tricks
-        budgets = {k: getattr(tricks, k) for k in ('future_draws', 'key_path_draws', 'query_keys')}
+        budgets = {k: getattr(tricks, k) for k in ('future_draws', 'key_path_draws', 'query_keys', 'route_k')}
         if tricks.no_paths:  # every credit that crosses attention to other tokens is dropped
             budgets.update(future_draws=0, key_path_draws=0, value_path=False, gate_path=False)
         estimator.s = replace(settings, **{k: v for k, v in budgets.items() if not isinstance(v, int) or isinstance(v, bool) or v >= 0})
@@ -3136,6 +3138,7 @@ def main():
     parser.add_argument('--probe-memory', type=int, default=0)
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
+    parser.add_argument('--route-k', type=int, default=-1)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
     parser.add_argument('--zo-tau', type=float, default=1e-3)
@@ -3169,7 +3172,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, route_k=args.route_k, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
