@@ -175,6 +175,8 @@ class Tricks:
     the new one along the measured rows, M <- M - (1 - b) P_S M + (1 - b) (r / d) G_S, where P_S projects onto the
     step's rows and (r / d) G_S is the unbiased chain gradient read back at weight 1. b is jaguar_beta (0 replaces).
     The path credit added to those weights stays fresh; other weights keep the unbiased partial estimate.
+    probe_seed: on resume, reseed the estimator's probe generators (same weights and batches, fresh draws), so a
+    resumed comparison can be repeated.
     future_learned: ZORL (learned direction sampling) on the future probes. Each source keeps r learned orthonormal
     directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
     the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
@@ -196,6 +198,7 @@ class Tricks:
     key_path_draws: int = -1
     query_keys: int = -1
     chain_rows: int = 0
+    probe_seed: int = 0
     jaguar: bool = False
     jaguar_beta: float = 0.0
     future_learned: int = 0
@@ -2552,6 +2555,10 @@ def restore_training_state(path, model, optimizer, estimator, *, recipe):
     torch.set_rng_state(random['cpu'])
     if random['cuda'] is not None:
         torch.cuda.set_rng_state(random['cuda'], estimator.device)
+    shift = getattr(getattr(estimator, 'tricks', None), 'probe_seed', 0)
+    if shift:  # fresh probe draws on the same weights and batches: a replicate of a resumed comparison
+        for i, g in enumerate((estimator.generator, estimator.shared_generator, estimator.capture.generator)):
+            g.manual_seed(1000003 * shift + 101 * i + estimator.rank)
     return checkpoint['step'], checkpoint['train_seconds']
 
 
@@ -2915,6 +2922,7 @@ def main():
     parser.add_argument('--key-path-draws', type=int, default=-1)
     parser.add_argument('--query-keys', type=int, default=-1)
     parser.add_argument('--chain-rows', type=int, default=0)
+    parser.add_argument('--probe-seed', type=int, default=0)
     parser.add_argument('--jaguar', action='store_true')
     parser.add_argument('--jaguar-beta', type=float, default=0.0)
     parser.add_argument('--future-learned', type=int, default=0)
@@ -2942,7 +2950,7 @@ def main():
                         probe_full_every=args.probe_full_every, probe_beta=args.probe_beta, trust=args.trust,
                         storm=args.storm, cv_every=args.cv_every, cv_beta=args.cv_beta,
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
-                        query_keys=args.query_keys, chain_rows=args.chain_rows, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
+                        query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
                         future_learned_lr=args.future_learned_lr, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
