@@ -185,6 +185,11 @@ class Tricks:
     directions (M = probe_memory). A step probes the top r (shared), probe_sampled fresh orthonormal directions drawn
     from the rest of the memory, and probe_explore random ones in the complement of the memory, read back unbiased
     with weights 1, (M - r) / s and (d - M) / k.
+    zo_probes, zo_scope, zo_tau, zo_beta: a weight-space ZO residual on top of the Cut estimate. For q Gaussian
+    directions z over the scope's matrices ('attn': the attention matrices, 'blocks': all block matrices), central
+    differences of the batch loss at theta +- tau z give z.g_true; the correction (z.g_true - z.g_cut) z / q is added
+    to the Cut gradient, unbiased for g_true - g_cut, so its noise scales with what Cut misses, not with g. zo_beta
+    keeps an exponential mean of the correction across steps (a JAGUAR-style buffer).
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
     an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
@@ -215,6 +220,10 @@ class Tricks:
     probe_memory: int = 0
     probe_sampled: int = 0
     no_paths: bool = False
+    zo_probes: int = 0
+    zo_scope: str = 'attn'
+    zo_tau: float = 1e-3
+    zo_beta: float = 0.0
     profile: bool = False
 
 
@@ -1279,6 +1288,47 @@ class Boost:
         self.diag['trust_rho'] = [round(v, 3) for v in rho.tolist()]
         self.diag['trust_mult'] = [round(v, 3) for v in mult.tolist()]
 
+    @torch.no_grad()
+    def zo_residual(self, x, y, params):
+        """Add the weight-space ZO correction (Tricks.zo_probes) to the scope's gradients in place."""
+        t = self.tricks
+        scope = [p for n, p in params if p.ndim == 2 and n.startswith('transformer.h.') and 've_gate' not in n
+                 and (t.zo_scope == 'blocks' or '.attn.' in n)]
+        seed0 = int(torch.randint(0, 2**31 - 1, (1,), generator=self.shared_generator, device=self.device).item())
+
+        def directions(j):
+            g = torch.Generator(self.device).manual_seed(seed0 + 7919 * j)
+            return [torch.randn(p.shape, device=self.device, generator=g) for p in scope]
+
+        correction = [torch.zeros_like(p, dtype=torch.float32) for p in scope]
+        ratios = []
+        for j in range(t.zo_probes):
+            z = directions(j)
+            for p, d in zip(scope, z):
+                p.add_(d.to(p.dtype), alpha=t.zo_tau)
+            plus = average_ranks(self.batch_loss(x, y).reshape(1))
+            for p, d in zip(scope, z):
+                p.add_(d.to(p.dtype), alpha=-2 * t.zo_tau)
+            minus = average_ranks(self.batch_loss(x, y).reshape(1))
+            for p, d in zip(scope, z):
+                p.add_(d.to(p.dtype), alpha=t.zo_tau)
+            along = (plus - minus).item() / (2 * t.zo_tau)
+            predicted = sum((p.grad.float() * d).sum() for p, d in zip(scope, z)).item()
+            ratios.append((along, predicted))
+            for c, d in zip(correction, z):
+                c.add_(d, alpha=(along - predicted) / t.zo_probes)
+        if t.zo_beta:
+            buf = self.__dict__.setdefault('zo_buffer', [torch.zeros_like(c) for c in correction])
+            for b, c in zip(buf, correction):
+                b.lerp_(c, 1 - t.zo_beta)
+            correction = buf
+        for p, c in zip(scope, correction):
+            p.grad = (p.grad.float() + c).to(p.dtype)
+        a = torch.tensor(ratios)
+        self.diag['zo_along_rms'] = round(a[:, 0].square().mean().sqrt().item(), 5)
+        self.diag['zo_cut_rms'] = round(a[:, 1].square().mean().sqrt().item(), 5)
+        self.diag['zo_cos'] = round(F.cosine_similarity(a[:, 0], a[:, 1], dim=0).item(), 4)
+
     def step(self, x, y, optimizer):
         self.diag = {}
         cut, t = isinstance(self, Cut), self.tricks
@@ -1301,6 +1351,8 @@ class Boost:
         for name, p in params:
             p.grad = flat[offset:offset + p.numel()].view_as(p).to(p.dtype)
             offset += p.numel()
+        if cut and t.zo_probes:
+            self.zo_residual(x, y, params)
         old = [p.detach().clone() for _, p in params] if cut and (t.trust or t.storm) else None
         optimizer.step()
         if cut and t.trust:
@@ -3001,6 +3053,10 @@ def main():
     parser.add_argument('--probe-memory', type=int, default=0)
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
+    parser.add_argument('--zo-probes', type=int, default=0)
+    parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
+    parser.add_argument('--zo-tau', type=float, default=1e-3)
+    parser.add_argument('--zo-beta', type=float, default=0.0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -3026,7 +3082,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
