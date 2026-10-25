@@ -181,6 +181,9 @@ class Tricks:
     directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
     the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
     credit's leading directions by an Oja step of size future_learned_lr. Logs the share of credit energy U held.
+    key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
+    an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
+    read back unbiased (weights 1 and (d - r) / k). Logs held_key_<block>, the energy share the subspace held.
     """
     probe_rank: int = 0
     probe_explore: int = 0
@@ -203,6 +206,7 @@ class Tricks:
     jaguar_beta: float = 0.0
     future_learned: int = 0
     future_learned_lr: float = 0.1
+    key_learned: int = 0
     profile: bool = False
 
 
@@ -1337,13 +1341,26 @@ class Cut(Boost):
         frame = hadamard(self.width, self.device, torch.float32)
         credits = {}
         raw_errors = {}
+        learned = getattr(getattr(self, 'tricks', None), 'key_learned', 0)
+        bases = self.__dict__.setdefault('key_subspaces', {})
         for i, target in targets.items():
             indices = torch.randperm(self.width, device=self.device, generator=generator)[:s.key_path_draws]
             signs = torch.randint(0, 2, (self.width,), device=self.device, generator=generator)*2-1
             rows = frame[indices] * signs
+            recon = None  # reconstruction directions with their unbiased weights, when they differ from rows/len
+            if learned and i in bases:
+                d, U = self.width, bases[i]
+                r, k = U.shape[0], s.key_path_draws - U.shape[0]
+                Q = torch.randn(d, k, device=self.device, generator=generator)
+                Q = torch.linalg.qr(Q - U.T @ (U @ Q)).Q.T
+                rows = torch.cat([U, Q]) * d ** 0.5
+                w = torch.cat([torch.ones(r, device=self.device), torch.full((k,), (d - r) / k, device=self.device)])
+                recon = rows * (w / d)[:, None]
             total_rows = len(rows)
             r0, r1 = self.share(total_rows)  # this GPU's share of the draws
             rows = rows[r0:r1]
+            if recon is not None:
+                recon = recon[r0:r1]
             estimate = torch.zeros(d.batch, d.length, self.width, device=self.device)
             raw_credit = torch.empty_like(estimate)
             w_key = self.model.transformer.h[i].attn.c_k.weight.float()
@@ -1370,7 +1387,10 @@ class Cut(Boost):
                                                    projected_rows, raw[:, sl], cos[sl], sin[sl])
                         scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
                                                     t0, qs.start, self.model.window_sizes[i][0])
-                        estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
+                        if recon is not None:
+                            estimate[r, sl] = decode_local_response(scores.sum(0).T, steps[sl], recon)
+                        else:
+                            estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
                         continue
                     derivatives = torch.empty(len(xin[sl]), len(rows), device=self.device)
                     for j0 in range(0, len(rows), s.key_chunk):
@@ -1379,11 +1399,31 @@ class Cut(Boost):
                             xin[sl], steps[sl], rows[js], projected_x[sl], projected_rows[js],
                             raw[:, sl], cos[sl], sin[sl],
                             qp[:, qs], A[:, qs, sl], C[:, qs, sl])
-                    estimate[r, sl] = derivatives @ rows / total_rows
+                    estimate[r, sl] = derivatives @ recon if recon is not None else derivatives @ rows / total_rows
             credits[i] = self.group_sum(estimate.flatten(0, 1))
+            if learned:
+                self.update_key_subspace(i, credits[i], learned)
             raw_errors[f'transformer.h.{i}.attn.c_k'] = raw_credit
         self._input_key_errors = raw_errors
         return credits
+
+    @torch.no_grad()
+    def update_key_subspace(self, i, credit, rank):
+        """Exponential mean of block i's key credit covariance (trace-normalised) and its top-rank eigenvectors; the
+        complement part enters at sqrt(k / (d - r)) of its unbiased read-back, as in update_subspaces."""
+        d, beta = self.width, getattr(self.tricks, 'probe_beta', 0.9)
+        bases = self.__dict__.setdefault('key_subspaces', {})
+        covs = self.__dict__.setdefault('key_covariances', {})
+        c, U = credit.float(), bases.get(i)
+        if U is not None:
+            inside = (c @ U.T) @ U
+            k = self.s.key_path_draws - rank
+            self.diag[f'held_key_{i}'] = round((inside.square().sum() / c.square().sum().clamp_min(1e-30)).item(), 4)
+            c = inside + (c - inside) * (k / (d - rank)) ** 0.5
+        cov = c.T @ c
+        cov = cov / cov.diagonal().sum().clamp_min(1e-30)
+        covs[i] = cov if i not in covs else covs[i].lerp(cov, 1 - beta)
+        bases[i] = torch.linalg.eigh(covs[i]).eigenvectors[:, -rank:].T.contiguous()
 
     def path_credits(self, chain, targets, raw_values=None):
         """Sum independent input responses, then transport only along residual identities."""
@@ -2927,6 +2967,7 @@ def main():
     parser.add_argument('--jaguar-beta', type=float, default=0.0)
     parser.add_argument('--future-learned', type=int, default=0)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
+    parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2952,7 +2993,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
