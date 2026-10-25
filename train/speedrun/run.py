@@ -192,6 +192,8 @@ class Tricks:
     draws the directions in the span of the top r input directions of each matrix (StructZO, AIM-ZO). zo_adaptive
     (ZoAQ) reuses the last zo_history probe answers and takes 2..zo_probes fresh ones by momentum agreement. zo_beta
     keeps an exponential mean of the correction across steps (a JAGUAR-style buffer).
+    matrix_rule, matrix_power: the direction of the block-matrix update from ANVIL's momentum: polar (Muon), sign
+    (JAGUAR SignSGD), power (Muon^p with p = matrix_power), equil (MuonEq).
     route_k: MLP neurons each chain probe moves through in place of the recipe's 512 (-1 keeps it).
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
@@ -223,6 +225,8 @@ class Tricks:
     probe_memory: int = 0
     probe_sampled: int = 0
     no_paths: bool = False
+    matrix_rule: str = 'polar'
+    matrix_power: float = 0.5
     route_k: int = -1
     zo_probes: int = 0
     zo_scope: str = 'attn'
@@ -2569,18 +2573,42 @@ def polar_batch(g, margin=1.1):
     return x.transpose(1, 2) if tall else x
 
 
+def matrix_step(m, margin, rule: str, power: float):
+    """The direction of the matrix update from the blended momentum m (B, r, c), all with the polar step's norm.
+
+    polar: msign(m) (Muon, ANVIL II). sign: elementwise sign(m), JAGUAR SignSGD. power: U S^p V^T, Muon^p
+    (fractional spectral powers), keeps part of the singular-value spread. equil: msign of m with rows and columns
+    balanced first (MuonEq)."""
+    if rule == 'polar':
+        return polar_batch(m, margin)
+    target = min(m.size(1), m.size(2)) ** 0.5
+    if rule == 'sign':
+        d = m.sign()
+    elif rule == 'power':
+        u, sv, vh = torch.linalg.svd(m, full_matrices=False)
+        d = u @ (sv.clamp_min(0) ** power).unsqueeze(-1).mul(vh)
+    else:
+        rows = m.norm(dim=2, keepdim=True).clamp_min(1e-10).sqrt()
+        cols = m.norm(dim=1, keepdim=True).clamp_min(1e-10).sqrt()
+        d = polar_batch(m / rows / cols, margin)
+    return d * (target / d.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
+
+
 @torch.compile(dynamic=False)
 def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd, lanes: int,
-                 ratio: float, margin: float):
+                 ratio: float, margin: float, rule: str = 'polar', power: float = 0.5):
     """One ANVIL II step for a stack of same-shape matrices; updates fast, slow and energy in place."""
     fast.lerp_(g, 1 - fast_beta)
     slow.lerp_(g, 1 - slow_beta)
-    update = polar_batch(g.lerp(weight * fast + (1 - weight) * slow, beta), margin)
+    update = matrix_step(g.lerp(weight * fast + (1 - weight) * slow, beta), margin, rule, power)
     energy.lerp_(update.square().mean(lanes + 1, keepdim=True), 1 - lane_beta)
     gained = update * energy.clamp_min(1e-10).rsqrt()
     update = gained * (update.norm(dim=(1, 2), keepdim=True) / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
     decay = (slow * w >= 0) * w * (wd * lr)
     return w - lr * ratio * (update + decay)
+
+
+MATRIX_RULE = ['polar', 0.5]  # set once from the command line before training (Tricks.matrix_rule, matrix_power)
 
 
 class BatchedAnvil(Anvil):
@@ -2632,7 +2660,8 @@ class BatchedAnvil(Anvil):
                 new = anvil_update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
                                    stack['fast'], stack['slow'], stack['energy'], value(beta), value(fast_beta),
                                    value(self.slow_beta), value(weight), value(self.lane_beta), value(lr), value(wd),
-                                   1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5, self.polar_margin)
+                                   1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5, self.polar_margin,
+                                   MATRIX_RULE[0], MATRIX_RULE[1])
                 torch._foreach_copy_(params, list(new.to(params[0].dtype).unbind(0)))
         self.t += 1
 
@@ -3139,6 +3168,8 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
+    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil'))
+    parser.add_argument('--matrix-power', type=float, default=0.5)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
     parser.add_argument('--zo-tau', type=float, default=1e-3)
@@ -3172,7 +3203,8 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, route_k=args.route_k, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+        MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
