@@ -2578,12 +2578,16 @@ def matrix_step(m, margin, rule: str, power: float):
 
     polar: msign(m) (Muon, ANVIL II). sign: elementwise sign(m), JAGUAR SignSGD. power: U S^p V^T, Muon^p
     (fractional spectral powers), keeps part of the singular-value spread. equil: msign of m with rows and columns
-    balanced first (MuonEq)."""
+    balanced first (MuonEq). normuon: msign(m) with every row rescaled to the same norm (NorMuon's neuron-wise
+    normalisation, without its running second moment)."""
     if rule == 'polar':
         return polar_batch(m, margin)
     target = min(m.size(1), m.size(2)) ** 0.5
     if rule == 'sign':
         d = m.sign()
+    elif rule == 'normuon':
+        d = polar_batch(m, margin)
+        d = d / d.norm(dim=2, keepdim=True).clamp_min(1e-10)
     elif rule == 'power':
         u, sv, vh = torch.linalg.svd(m, full_matrices=False)
         d = u @ (sv.clamp_min(0) ** power).unsqueeze(-1).mul(vh)
