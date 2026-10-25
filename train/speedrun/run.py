@@ -3172,7 +3172,7 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
-    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil'))
+    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon'))
     parser.add_argument('--matrix-power', type=float, default=0.5)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
