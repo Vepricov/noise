@@ -1349,13 +1349,13 @@ class Cut(Boost):
             rows = frame[indices] * signs
             recon = None  # reconstruction directions with their unbiased weights, when they differ from rows/len
             if learned and i in bases:
-                d, U = self.width, bases[i]
+                n, U = self.width, bases[i]
                 r, k = U.shape[0], s.key_path_draws - U.shape[0]
-                Q = torch.randn(d, k, device=self.device, generator=generator)
+                Q = torch.randn(n, k, device=self.device, generator=generator)
                 Q = torch.linalg.qr(Q - U.T @ (U @ Q)).Q.T
-                rows = torch.cat([U, Q]) * d ** 0.5
-                w = torch.cat([torch.ones(r, device=self.device), torch.full((k,), (d - r) / k, device=self.device)])
-                recon = rows * (w / d)[:, None]
+                rows = torch.cat([U, Q]) * n ** 0.5
+                w = torch.cat([torch.ones(r, device=self.device), torch.full((k,), (n - r) / k, device=self.device)])
+                recon = rows * (w / n)[:, None]
             total_rows = len(rows)
             r0, r1 = self.share(total_rows)  # this GPU's share of the draws
             rows = rows[r0:r1]
