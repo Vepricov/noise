@@ -188,7 +188,8 @@ class Tricks:
     zo_probes, zo_scope, zo_tau, zo_beta: a weight-space ZO residual on top of the Cut estimate. For q Gaussian
     directions z over the scope's matrices ('attn': the attention matrices, 'blocks': all block matrices), central
     differences of the batch loss at theta +- tau z give z.g_true; the correction (z.g_true - z.g_cut) z / q is added
-    to the Cut gradient, unbiased for g_true - g_cut, so its noise scales with what Cut misses, not with g. zo_beta
+    to the Cut gradient, unbiased for g_true - g_cut, so its noise scales with what Cut misses, not with g. zo_act_rank r
+    draws the directions in the span of the top r input directions of each matrix (StructZO, AIM-ZO). zo_beta
     keeps an exponential mean of the correction across steps (a JAGUAR-style buffer).
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
@@ -224,6 +225,7 @@ class Tricks:
     zo_scope: str = 'attn'
     zo_tau: float = 1e-3
     zo_beta: float = 0.0
+    zo_act_rank: int = 0
     profile: bool = False
 
 
@@ -1294,11 +1296,17 @@ class Boost:
         t = self.tricks
         scope = [p for n, p in params if p.ndim == 2 and n.startswith('transformer.h.') and 've_gate' not in n
                  and (t.zo_scope == 'blocks' or '.attn.' in n)]
+        names = {id(p): n for n, p in params}
         seed0 = int(torch.randint(0, 2**31 - 1, (1,), generator=self.shared_generator, device=self.device).item())
+        bases = [self.activation_basis(names[id(p)][:-len('.weight')], p, seed0) if t.zo_act_rank else None
+                 for p in scope]
 
         def directions(j):
             g = torch.Generator(self.device).manual_seed(seed0 + 7919 * j)
-            return [torch.randn(p.shape, device=self.device, generator=g) for p in scope]
+            if not t.zo_act_rank:
+                return [torch.randn(p.shape, device=self.device, generator=g) for p in scope]
+            return [torch.randn(p.shape[0], P.shape[1], device=self.device, generator=g) @ P.T
+                    for p, P in zip(scope, bases)]
 
         correction = [torch.zeros_like(p, dtype=torch.float32) for p in scope]
         ratios = []
@@ -1328,6 +1336,17 @@ class Boost:
         self.diag['zo_along_rms'] = round(a[:, 0].square().mean().sqrt().item(), 5)
         self.diag['zo_cut_rms'] = round(a[:, 1].square().mean().sqrt().item(), 5)
         self.diag['zo_cos'] = round(F.cosine_similarity(a[:, 0], a[:, 1], dim=0).item(), 4)
+
+    def activation_basis(self, site, p, seed):
+        """StructZO / AIM-ZO: an orthonormal basis of the top zo_act_rank directions of the layer's input Gram A^T A.
+
+        The weight gradient of a linear layer is Delta^T A, so its rows lie in the span of the inputs A; directions
+        Z P^T with Z Gaussian are unbiased for the projection of what Cut misses onto that span."""
+        a = self.capture.inputs[site].flatten(0, 1).float()
+        r = min(self.tricks.zo_act_rank, p.shape[1])
+        g = torch.Generator(self.device).manual_seed(seed + 104729)
+        omega = torch.randn(p.shape[1], r + 8, device=self.device, generator=g)
+        return torch.linalg.qr(a.T @ (a @ omega)).Q[:, :r]
 
     def step(self, x, y, optimizer):
         self.diag = {}
@@ -3057,6 +3076,7 @@ def main():
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
     parser.add_argument('--zo-tau', type=float, default=1e-3)
     parser.add_argument('--zo-beta', type=float, default=0.0)
+    parser.add_argument('--zo-act-rank', type=int, default=0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -3082,7 +3102,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
