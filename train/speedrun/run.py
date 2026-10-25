@@ -181,6 +181,10 @@ class Tricks:
     directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
     the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
     credit's leading directions by an Oja step of size future_learned_lr. Logs the share of credit energy U held.
+    probe_memory, probe_sampled: AIM-ZO on the chain. With probe_rank r, each root keeps a memory of its top-M credit
+    directions (M = probe_memory). A step probes the top r (shared), probe_sampled fresh orthonormal directions drawn
+    from the rest of the memory, and probe_explore random ones in the complement of the memory, read back unbiased
+    with weights 1, (M - r) / s and (d - M) / k.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
     an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
     read back unbiased (weights 1 and (d - r) / k). Logs held_key_<block>, the energy share the subspace held.
@@ -207,6 +211,8 @@ class Tricks:
     future_learned: int = 0
     future_learned_lr: float = 0.1
     key_learned: int = 0
+    probe_memory: int = 0
+    probe_sampled: int = 0
     profile: bool = False
 
 
@@ -1611,6 +1617,18 @@ class Cut(Boost):
             return H[lo:hi], None
         d, U, k = self.width, self.subspaces[site], self.tricks.probe_explore
         r = U.shape[0]
+        if self.tricks.probe_memory:
+            M, sm = self.tricks.probe_memory, self.tricks.probe_sampled
+            rest = self.memories[site][r:]
+            S = torch.linalg.qr(torch.randn(M - r, sm, device=self.device, generator=self.generator)).Q.T @ rest
+            V = torch.cat([U, rest])
+            Q = torch.randn(d, k, device=self.device, generator=self.generator)
+            Q = torch.linalg.qr(Q - V.T @ (V @ Q)).Q.T
+            D = torch.cat([U, S, Q]) * d ** 0.5
+            w = torch.cat([torch.ones(r, device=self.device), torch.full((sm,), (M - r) / sm, device=self.device),
+                           torch.full((k,), (d - M) / k, device=self.device)])
+            per = (r + sm + k) // self.split
+            return D[self.part * per:(self.part + 1) * per].contiguous(), w[self.part * per:(self.part + 1) * per]
         Q = torch.randn(d, k, device=self.device, generator=self.generator)
         Q = torch.linalg.qr(Q - U.T @ (U @ Q)).Q.T
         D = torch.cat([U, Q]) * d ** 0.5
@@ -1628,7 +1646,12 @@ class Cut(Boost):
             if isinstance(key, tuple):
                 continue
             c, U = c.float(), self.subspaces.get(key)
-            if U is not None:
+            if U is not None and t.probe_memory:
+                V = self.memories[key]
+                inside, mem = (c @ U.T) @ U, (c @ V.T) @ V
+                M, sm = t.probe_memory, t.probe_sampled
+                c = inside + (mem - inside) * (sm / (M - t.probe_rank)) ** 0.5 + (c - mem) * (t.probe_explore / (d - M)) ** 0.5
+            elif U is not None:
                 inside = (c @ U.T) @ U
                 if full:
                     self.diag[f'held_{key}'] = round((inside.square().sum() / c.square().sum().clamp_min(1e-30)).item(), 4)
@@ -1638,7 +1661,10 @@ class Cut(Boost):
             cov = cov / cov.diagonal().sum().clamp_min(1e-30)
             old = self.covariances.get(key)
             self.covariances[key] = cov if old is None else old.lerp(cov, 1 - t.probe_beta)
-            self.subspaces[key] = torch.linalg.eigh(self.covariances[key]).eigenvectors[:, -t.probe_rank:].T.contiguous()
+            vectors = torch.linalg.eigh(self.covariances[key]).eigenvectors
+            self.subspaces[key] = vectors[:, -t.probe_rank:].T.flip(0).contiguous()
+            if t.probe_memory:
+                self.__dict__.setdefault('memories', {})[key] = vectors[:, -t.probe_memory:].T.flip(0).contiguous()
 
     def own_query_inputs(self, sequence=0):
         """Clean keys/values for one sequence; preserve upstream math and token positions."""
@@ -2968,6 +2994,8 @@ def main():
     parser.add_argument('--future-learned', type=int, default=0)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
+    parser.add_argument('--probe-memory', type=int, default=0)
+    parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -2993,7 +3021,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
