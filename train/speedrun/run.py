@@ -185,6 +185,7 @@ class Tricks:
     directions (M = probe_memory). A step probes the top r (shared), probe_sampled fresh orthonormal directions drawn
     from the rest of the memory, and probe_explore random ones in the complement of the memory, read back unbiased
     with weights 1, (M - r) / s and (d - M) / k.
+    no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
     an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
     read back unbiased (weights 1 and (d - r) / k). Logs held_key_<block>, the energy share the subspace held.
@@ -213,6 +214,7 @@ class Tricks:
     key_learned: int = 0
     probe_memory: int = 0
     probe_sampled: int = 0
+    no_paths: bool = False
     profile: bool = False
 
 
@@ -2845,7 +2847,9 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
             raise ValueError('Subspace probes need explore directions and r + s divisible across the sequence group')
         estimator.tricks = tricks
         budgets = {k: getattr(tricks, k) for k in ('future_draws', 'key_path_draws', 'query_keys')}
-        estimator.s = replace(settings, **{k: v for k, v in budgets.items() if v >= 0})
+        if tricks.no_paths:  # every credit that crosses attention to other tokens is dropped
+            budgets.update(future_draws=0, key_path_draws=0, value_path=False, gate_path=False)
+        estimator.s = replace(settings, **{k: v for k, v in budgets.items() if not isinstance(v, int) or isinstance(v, bool) or v >= 0})
         return estimator
 
     def rank_slice(batch, phase):
@@ -2996,6 +3000,7 @@ def main():
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
     parser.add_argument('--probe-sampled', type=int, default=0)
+    parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--switch', type=float, default=0.2, help='Boost fraction; changes the recipe (smoke tests).')
     args = parser.parse_args()
@@ -3021,7 +3026,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, profile=args.profile)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
