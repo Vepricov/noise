@@ -2796,8 +2796,9 @@ def save_training_state(path, model, optimizer, estimator, *, step, train_second
 def restore_training_state(path, model, optimizer, estimator, *, recipe):
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     canonical = lambda x: json.loads(json.dumps(x))
-    if canonical(checkpoint['recipe']) != canonical(recipe) or checkpoint['world'] != estimator.world:
-        raise ValueError('Resume requires the same recipe and number of ranks')
+    if canonical(checkpoint['recipe']) != canonical(recipe):
+        raise ValueError('Resume requires the same recipe')
+    resharded = checkpoint['world'] != estimator.world  # weights and optimizer are global; only the RNG is per rank
     if checkpoint['estimator'] != type(estimator).__name__:
         raise ValueError('Resume requires the same estimator phase')
     if checkpoint['schedule_steps'] != optimizer.optimizers[0].total or checkpoint['memory'] is not None:
@@ -2810,7 +2811,7 @@ def restore_training_state(path, model, optimizer, estimator, *, recipe):
         if saved['t'] is not None:
             active.t = saved['t']
     optimizer.param_groups = [g for active in optimizer.optimizers for g in active.param_groups]
-    random = checkpoint['rng'][estimator.rank]
+    random = checkpoint['rng'][estimator.rank % checkpoint['world']]
     estimator.generator.set_state(random['generator'])
     estimator.shared_generator.set_state(random['shared_generator'])
     estimator.capture.generator.set_state(random['capture_generator'])
@@ -2818,9 +2819,9 @@ def restore_training_state(path, model, optimizer, estimator, *, recipe):
     if random['cuda'] is not None:
         torch.cuda.set_rng_state(random['cuda'], estimator.device)
     shift = getattr(getattr(estimator, 'tricks', None), 'probe_seed', 0)
-    if shift:  # fresh probe draws on the same weights and batches: a replicate of a resumed comparison
+    if shift or resharded:  # fresh probe draws on the same weights and batches (or on a new number of ranks)
         for i, g in enumerate((estimator.generator, estimator.shared_generator, estimator.capture.generator)):
-            g.manual_seed(1000003 * shift + 101 * i + estimator.rank)
+            g.manual_seed(1000003 * shift + 101 * i + (0 if i == 1 else estimator.rank))  # the shared one stays shared
     return checkpoint['step'], checkpoint['train_seconds']
 
 
