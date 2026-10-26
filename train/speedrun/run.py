@@ -193,7 +193,8 @@ class Tricks:
     (ZoAQ) reuses the last zo_history probe answers and takes 2..zo_probes fresh ones by momentum agreement. zo_beta
     keeps an exponential mean of the correction across steps (a JAGUAR-style buffer).
     matrix_rule, matrix_power: the direction of the block-matrix update from ANVIL's momentum: polar (Muon), sign
-    (JAGUAR SignSGD), power (Muon^p with p = matrix_power), equil (MuonEq).
+    (JAGUAR SignSGD), power (Muon^p with p = matrix_power), equil (MuonEq), topk (the polar factor of the top
+    matrix_power singular directions only: ZO-MOPI's partial orthogonalisation, IHT-SpecGD's spectral step).
     route_k: MLP neurons each chain probe moves through in place of the recipe's 512 (-1 keeps it).
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     full_warmdown: the probe budgets above hold until Cut's warmdown starts; from there on the recipe's own budgets
@@ -2583,7 +2584,8 @@ def matrix_step(m, margin, rule: str, power: float):
     (fractional spectral powers), keeps part of the singular-value spread. equil: msign of m with rows and columns
     balanced first (MuonEq). normuon: msign(m) with every row rescaled to the same norm (NorMuon's neuron-wise
     normalisation, without its running second moment). adamuon: msign(m), with ANVIL's lane energy kept per element
-    instead (AdaMuon). adam: m itself with that elementwise second moment, no orthogonalisation. snr: AdaMuon times
+    instead (AdaMuon). adam: m itself with that elementwise second moment, no orthogonalisation. topk: U_k V_k^T of
+    the top k = power singular directions, the rest of the spectrum dropped (ZO-MOPI, IHT-SpecGD). snr: AdaMuon times
     each element's signal-to-noise ratio |E[O]| / sqrt(E[O^2]) of the polar step O."""
     if rule in ('polar', 'adamuon', 'snr'):
         return polar_batch(m, margin)
@@ -2598,6 +2600,10 @@ def matrix_step(m, margin, rule: str, power: float):
     elif rule == 'power':
         u, sv, vh = torch.linalg.svd(m, full_matrices=False)
         d = u @ (sv.clamp_min(0) ** power).unsqueeze(-1).mul(vh)
+    elif rule == 'topk':
+        u, _, vh = torch.linalg.svd(m, full_matrices=False)
+        k = int(power)
+        d = u[..., :k] @ vh[..., :k, :]
     else:
         rows = m.norm(dim=2, keepdim=True).clamp_min(1e-10).sqrt()
         cols = m.norm(dim=1, keepdim=True).clamp_min(1e-10).sqrt()
@@ -3196,7 +3202,7 @@ def main():
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--full-warmdown', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
-    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam', 'snr'))
+    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam', 'snr', 'topk'))
     parser.add_argument('--matrix-power', type=float, default=0.5)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
