@@ -2580,8 +2580,9 @@ def matrix_step(m, margin, rule: str, power: float):
     (fractional spectral powers), keeps part of the singular-value spread. equil: msign of m with rows and columns
     balanced first (MuonEq). normuon: msign(m) with every row rescaled to the same norm (NorMuon's neuron-wise
     normalisation, without its running second moment). adamuon: msign(m), with ANVIL's lane energy kept per element
-    instead (AdaMuon). adam: m itself with that elementwise second moment, no orthogonalisation."""
-    if rule in ('polar', 'adamuon'):
+    instead (AdaMuon). adam: m itself with that elementwise second moment, no orthogonalisation. snr: AdaMuon times
+    each element's signal-to-noise ratio |E[O]| / sqrt(E[O^2]) of the polar step O."""
+    if rule in ('polar', 'adamuon', 'snr'):
         return polar_batch(m, margin)
     target = min(m.size(1), m.size(2)) ** 0.5
     if rule == 'sign':
@@ -2602,16 +2603,20 @@ def matrix_step(m, margin, rule: str, power: float):
 
 
 @torch.compile(dynamic=False)
-def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd, lanes: int,
+def anvil_update(g, w, fast, slow, energy, drift, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd, lanes: int,
                  ratio: float, margin: float, rule: str = 'polar', power: float = 0.5):
-    """One ANVIL II step for a stack of same-shape matrices; updates fast, slow and energy in place."""
+    """One ANVIL II step for a stack of same-shape matrices; updates fast, slow, energy and drift in place."""
     fast.lerp_(g, 1 - fast_beta)
     slow.lerp_(g, 1 - slow_beta)
     update = matrix_step(g.lerp(weight * fast + (1 - weight) * slow, beta), margin, rule, power)
-    # AdaMuon and adam keep the second moment per element; ANVIL keeps it per lane.
+    # AdaMuon, adam and snr keep the second moment per element; ANVIL keeps it per lane.
     square = update.square()
-    energy.lerp_(square if rule in ('adamuon', 'adam') else square.mean(lanes + 1, keepdim=True), 1 - lane_beta)
+    energy.lerp_(square if rule in ('adamuon', 'adam', 'snr') else square.mean(lanes + 1, keepdim=True), 1 - lane_beta)
     gained = update * energy.clamp_min(1e-10).rsqrt()
+    if rule == 'snr':
+        # Scale each element by its signal-to-noise ratio |E[O]| / sqrt(E[O^2]) of the step itself.
+        drift.lerp_(update, 1 - lane_beta)
+        gained = gained * drift.abs() * energy.clamp_min(1e-10).rsqrt()
     update = gained * (update.norm(dim=(1, 2), keepdim=True) / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
     decay = (slow * w >= 0) * w * (wd * lr)
     return w - lr * ratio * (update + decay)
@@ -2649,10 +2654,12 @@ class BatchedAnvil(Anvil):
             # A lane energy resumed into AdaMuon starts as its broadcast over elements.
             return torch.stack(held).expand_as(like).clone()
 
-        energy = weights if MATRIX_RULE[0] in ('adamuon', 'adam') else weights.mean(lanes + 1, keepdim=True)
-        stack = dict(fast=gathered('fast', weights), slow=gathered('slow', weights), energy=gathered('energy', energy))
+        energy = weights if MATRIX_RULE[0] in ('adamuon', 'adam', 'snr') else weights.mean(lanes + 1, keepdim=True)
+        stack = dict(fast=gathered('fast', weights), slow=gathered('slow', weights), energy=gathered('energy', energy),
+                     drift=gathered('drift', energy))
         for i, p in enumerate(params):
-            self.state[p].update(fast=stack['fast'][i], slow=stack['slow'][i], energy=stack['energy'][i])
+            self.state[p].update(fast=stack['fast'][i], slow=stack['slow'][i], energy=stack['energy'][i],
+                                 drift=stack['drift'][i])
         self.stacks[key] = stack
         return stack
 
@@ -2670,7 +2677,7 @@ class BatchedAnvil(Anvil):
             for shape, params in by_shape.items():
                 stack = self.stacked_state(shape, params)
                 new = anvil_update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
-                                   stack['fast'], stack['slow'], stack['energy'], value(beta), value(fast_beta),
+                                   stack['fast'], stack['slow'], stack['energy'], stack['drift'], value(beta), value(fast_beta),
                                    value(self.slow_beta), value(weight), value(self.lane_beta), value(lr), value(wd),
                                    1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5, self.polar_margin,
                                    MATRIX_RULE[0], MATRIX_RULE[1])
@@ -3180,7 +3187,7 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
-    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam'))
+    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam', 'snr'))
     parser.add_argument('--matrix-power', type=float, default=0.5)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
