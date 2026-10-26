@@ -2580,12 +2580,14 @@ def matrix_step(m, margin, rule: str, power: float):
     (fractional spectral powers), keeps part of the singular-value spread. equil: msign of m with rows and columns
     balanced first (MuonEq). normuon: msign(m) with every row rescaled to the same norm (NorMuon's neuron-wise
     normalisation, without its running second moment). adamuon: msign(m), with ANVIL's lane energy kept per element
-    instead (AdaMuon)."""
+    instead (AdaMuon). adam: m itself with that elementwise second moment, no orthogonalisation."""
     if rule in ('polar', 'adamuon'):
         return polar_batch(m, margin)
     target = min(m.size(1), m.size(2)) ** 0.5
     if rule == 'sign':
         d = m.sign()
+    elif rule == 'adam':
+        d = m
     elif rule == 'normuon':
         d = polar_batch(m, margin)
         d = d / d.norm(dim=2, keepdim=True).clamp_min(1e-10)
@@ -2606,9 +2608,9 @@ def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, l
     fast.lerp_(g, 1 - fast_beta)
     slow.lerp_(g, 1 - slow_beta)
     update = matrix_step(g.lerp(weight * fast + (1 - weight) * slow, beta), margin, rule, power)
-    # AdaMuon keeps the second moment per element; ANVIL keeps it per lane.
+    # AdaMuon and adam keep the second moment per element; ANVIL keeps it per lane.
     square = update.square()
-    energy.lerp_(square if rule == 'adamuon' else square.mean(lanes + 1, keepdim=True), 1 - lane_beta)
+    energy.lerp_(square if rule in ('adamuon', 'adam') else square.mean(lanes + 1, keepdim=True), 1 - lane_beta)
     gained = update * energy.clamp_min(1e-10).rsqrt()
     update = gained * (update.norm(dim=(1, 2), keepdim=True) / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
     decay = (slow * w >= 0) * w * (wd * lr)
@@ -2647,7 +2649,7 @@ class BatchedAnvil(Anvil):
             # A lane energy resumed into AdaMuon starts as its broadcast over elements.
             return torch.stack(held).expand_as(like).clone()
 
-        energy = weights if MATRIX_RULE[0] == 'adamuon' else weights.mean(lanes + 1, keepdim=True)
+        energy = weights if MATRIX_RULE[0] in ('adamuon', 'adam') else weights.mean(lanes + 1, keepdim=True)
         stack = dict(fast=gathered('fast', weights), slow=gathered('slow', weights), energy=gathered('energy', energy))
         for i, p in enumerate(params):
             self.state[p].update(fast=stack['fast'][i], slow=stack['slow'][i], energy=stack['energy'][i])
@@ -3178,7 +3180,7 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
-    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon'))
+    parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam'))
     parser.add_argument('--matrix-power', type=float, default=0.5)
     parser.add_argument('--zo-probes', type=int, default=0)
     parser.add_argument('--zo-scope', choices=('attn', 'blocks'), default='attn')
