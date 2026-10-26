@@ -199,6 +199,8 @@ class Tricks:
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     full_warmdown: the probe budgets above hold until Cut's warmdown starts; from there on the recipe's own budgets
     (less estimator noise where the rate decays, as a growing batch in place of a decaying rate).
+    merge_long: the end merge also keeps means with weights 0.005 and 0.0025 on the newest weights and the equal mean
+    of every merge point (Polyak averaging): a noisier estimator wants a longer mean than the recipe's 0.01.
     key_learned: ZORL on the input-K probes. Of the key_path_draws directions per block, r are the top eigenvectors of
     an exponential mean (probe_beta) of that block's key credit covariance, the rest random in their complement, each
     read back unbiased (weights 1 and (d - r) / k). Logs held_key_<block>, the energy share the subspace held.
@@ -229,6 +231,7 @@ class Tricks:
     probe_sampled: int = 0
     no_paths: bool = False
     full_warmdown: bool = False
+    merge_long: bool = False
     matrix_rule: str = 'polar'
     matrix_power: float = 0.5
     route_k: int = -1
@@ -2870,7 +2873,8 @@ def merge_part(name):
 
 HOLDOUT = 32  # training sequences that feed no update and score the end merge
 MERGE_FROM, MERGE_EVERY = 0.6, 5  # the exponential means follow the weights from 60% of the epoch, every 5 updates
-MERGE_DECAYS = (0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01)  # weight of the newest weights in each mean
+MERGE_DECAYS = [0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01]  # weight of the newest weights in each mean
+MERGE_LONG = [0.005, 0.0025, 0.0]  # --merge-long: longer means, and 0.0 = the equal mean of every merge point (Polyak)
 MERGE_RHOS = (0.0, 0.5, 1.0)  # how far a candidate moves outside the high-curvature subspace
 MERGE_K, MERGE_TOKENS = 64, 512  # input-covariance directions per linear layer; frequent-token rows per table
 
@@ -3121,10 +3125,12 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
                 with torch.no_grad():  # a resumed run restarts the means at its resumed weights
                     if means is None:
                         means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
+                        merged = 1
                     else:
+                        merged += 1
                         for a, mean in zip(MERGE_DECAYS, means):
                             for m, q in zip(mean, model.parameters()):
-                                m.lerp_(q.detach().float(), a)
+                                m.lerp_(q.detach().float(), a or 1 / merged)
             if (args.checkpoint_every and (step % args.checkpoint_every == 0 or step == stop)) or step == stop < steps:
                 pause = time.perf_counter()
                 save_training_state(args.output/'checkpoint.pt', model, optimizer, estimator, step=step,
@@ -3202,6 +3208,7 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--full-warmdown', action='store_true')
+    parser.add_argument('--merge-long', action='store_true')
     parser.add_argument('--route-k', type=int, default=-1)
     parser.add_argument('--matrix-rule', default='polar', choices=('polar', 'sign', 'power', 'equil', 'normuon', 'adamuon', 'adam', 'snr', 'topk'))
     parser.add_argument('--matrix-power', type=float, default=0.5)
@@ -3238,8 +3245,10 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, merge_long=args.merge_long, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
+        if tricks.merge_long:
+            MERGE_DECAYS.extend(MERGE_LONG)
         train_stages(args, settings, device, rank, world, tricks)
     finally:
         if world > 1:
