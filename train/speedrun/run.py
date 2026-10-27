@@ -1429,7 +1429,10 @@ class Boost:
         r = min(self.tricks.zo_act_rank, p.shape[1])
         g = torch.Generator(self.device).manual_seed(seed + 104729)
         omega = torch.randn(p.shape[1], r + 8, device=self.device, generator=g)
-        return torch.linalg.qr(a.T @ (a @ omega)).Q[:, :r]
+        sketch = a.T @ (a @ omega)
+        if self.world > 1:  # one basis for every rank: the probe moves the shared weights and the loss is averaged
+            torch.distributed.all_reduce(sketch)
+        return torch.linalg.qr(sketch).Q[:, :r]
 
     def step(self, x, y, optimizer):
         self.diag = {}
