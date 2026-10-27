@@ -234,6 +234,7 @@ class Tricks:
     future_learned: int = 0
     future_hub: bool = False
     future_noise: int = 0
+    tie_embed: bool = False
     future_learned_lr: float = 0.1
     key_learned: int = 0
     probe_memory: int = 0
@@ -3163,6 +3164,13 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
     optimizer, estimator = make_optimizer(model, settings, phases[phase]), estimator_for(model, phase)
     if args.resume:
         completed, previous_seconds = restore_training_state(args.resume, model, optimizer, estimator, recipe=recipe_state)
+
+    def tie():  # the embedding table is the head: its rows follow the head's exact first-order gradient
+        with torch.no_grad():
+            model.transformer.wte.weight.copy_(model.lm_head.weight)
+
+    if tricks.tie_embed:
+        tie()
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -3189,6 +3197,8 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
                 estimator.tricks = tricks  # in place: learned key and chain subspaces carry on
                 estimator.s = replace(estimator.s, future_draws=tricks.warmdown_future)
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+            if tricks.tie_embed:
+                tie()
             torch.cuda.synchronize()
             elapsed = previous_seconds + time.perf_counter()-start-paused
             record = dict(step=step, phase=phase, phase_step=phase_step, seqs=end,
@@ -3284,6 +3294,7 @@ def main():
     parser.add_argument('--future-learned', type=int, default=0)
     parser.add_argument('--future-hub', action='store_true')
     parser.add_argument('--future-noise', type=int, default=0)
+    parser.add_argument('--tie-embed', action='store_true')
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
@@ -3329,7 +3340,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, tie_embed=args.tie_embed, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
