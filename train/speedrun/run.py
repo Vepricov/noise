@@ -236,6 +236,7 @@ class Tricks:
     future_noise: int = 0
     tie_embed: bool = False
     future_js: float = 0.0
+    future_js_every: int = 1
     future_learned_lr: float = 0.1
     key_learned: int = 0
     probe_memory: int = 0
@@ -2489,15 +2490,21 @@ def add_future_gradients(estimator, gradients):
         future_noise_report(e, future, gradients, seed)
     shrink = e.tricks.future_js
     half = s.future_draws // 2
+    e.js_calls = getattr(e, 'js_calls', 0)+1
+    weights = getattr(e, 'js_weights', {})
+    measure = shrink and (not weights or (e.js_calls-1) % e.tricks.future_js_every == 0)
     halves = {}  # James-Stein: the first half of the draws against the whole, as weight gradients per site
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
-        estimates = future.estimate((half, s.future_draws) if shrink else (s.future_draws,))
+        estimates = future.estimate((half, s.future_draws) if measure else (s.future_draws,))
         for p, corrections in estimates.items():
             for site, credit in corrections.items():
                 inputs = d.inputs[site][sequence]
-                if shrink:
+                if measure:
+                    gradient = halves.setdefault(site, {}).setdefault(
+                        p, torch.zeros_like(gradients[site + '.weight'], dtype=torch.float32))
+                elif shrink:  # between measurements: the last weight on a single budget
                     gradient = halves.setdefault(site, {}).setdefault(
                         p, torch.zeros_like(gradients[site + '.weight'], dtype=torch.float32))
                 else:
@@ -2515,6 +2522,9 @@ def add_future_gradients(estimator, gradients):
         future.contexts = None
         del estimates
     for site, pair in halves.items():
+        if not measure:
+            gradients[site + '.weight'] += (weights[site]*pair[s.future_draws]).to(gradients[site + '.weight'].dtype)
+            continue
         a, full = pair[half], pair[s.future_draws]
         a_mean, b_mean = a.clone(), 2*full - a  # the two halves use disjoint draws on every rank
         if torch.distributed.is_initialized():
@@ -2526,8 +2536,10 @@ def add_future_gradients(estimator, gradients):
         ema[0], ema[1] = .95*ema[0]+.05*signal, .95*ema[1]+.05*noise
         # momentum (beta 0.9) averages independent probe noise over steps by (1-beta)/(1+beta)
         weight = min(1., max(0., ema[0]/(ema[0]+ema[1]*(1-shrink)/(1+shrink)+1e-30)))
+        weights[site] = weight
         e.diag['js_'+site.replace('transformer.', '').replace('.weight', '')] = round(weight, 3)
         gradients[site + '.weight'] += (weight*full).to(gradients[site + '.weight'].dtype)
+    e.js_weights = weights
 
 
 @torch.no_grad()
@@ -3320,6 +3332,7 @@ def main():
     parser.add_argument('--future-noise', type=int, default=0)
     parser.add_argument('--tie-embed', action='store_true')
     parser.add_argument('--future-js', type=float, default=0.0)
+    parser.add_argument('--future-js-every', type=int, default=1)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
@@ -3365,7 +3378,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, tie_embed=args.tie_embed, future_js=args.future_js, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, tie_embed=args.tie_embed, future_js=args.future_js, future_js_every=args.future_js_every, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
