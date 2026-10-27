@@ -235,6 +235,7 @@ class Tricks:
     future_hub: bool = False
     future_noise: int = 0
     tie_embed: bool = False
+    future_js: float = 0.0
     future_learned_lr: float = 0.1
     key_learned: int = 0
     probe_memory: int = 0
@@ -887,6 +888,7 @@ class Boost:
         self.subspaces, self.covariances, self.cut_calls = {}, {}, 0
         self.trust_mult, self.storm_m, self.storm_w = None, None, None
         self.cv_d, self.cv_calls = None, 0
+        self.js_moments = {}
 
     def close(self):
         self.capture.close()
@@ -2485,25 +2487,47 @@ def add_future_gradients(estimator, gradients):
     e.future_calls = getattr(e, 'future_calls', 0)+1
     if every and e.rank == 0 and (e.future_calls-1) % every == 0:
         future_noise_report(e, future, gradients, seed)
+    shrink = e.tricks.future_js
+    half = s.future_draws // 2
+    halves = {}  # James-Stein: the first half of the draws against the whole, as weight gradients per site
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
-        corrections = future.estimate((s.future_draws,))[s.future_draws]
-        for site, credit in corrections.items():
-            inputs = d.inputs[site][sequence]
-            gradient = gradients[site + '.weight']
-            if 'mlp.c_fc' in site:
-                raw = d.outputs[site][sequence].float()
-                step = s.future_sigma*raw.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
-                # Coordinates that are inactive in every signed trial have no
-                # response; remove their partial-cycle decoding cross-talk.
-                credit = credit * (raw+step > 0)[None]
-            if site == 'transformer.wte':
-                gradient.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2))
-            else:
-                gradient.addmm_(credit[0].T, inputs)
+        estimates = future.estimate((half, s.future_draws) if shrink else (s.future_draws,))
+        for p, corrections in estimates.items():
+            for site, credit in corrections.items():
+                inputs = d.inputs[site][sequence]
+                if shrink:
+                    gradient = halves.setdefault(site, {}).setdefault(
+                        p, torch.zeros_like(gradients[site + '.weight'], dtype=torch.float32))
+                else:
+                    gradient = gradients[site + '.weight']
+                if 'mlp.c_fc' in site:
+                    raw = d.outputs[site][sequence].float()
+                    step = s.future_sigma*raw.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+                    # Coordinates that are inactive in every signed trial have no
+                    # response; remove their partial-cycle decoding cross-talk.
+                    credit = credit * (raw+step > 0)[None]
+                if site == 'transformer.wte':
+                    gradient.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2).to(gradient.dtype))
+                else:
+                    gradient.addmm_(credit[0].T.to(gradient.dtype), inputs.to(gradient.dtype))
         future.contexts = None
-        del corrections
+        del estimates
+    for site, pair in halves.items():
+        a, full = pair[half], pair[s.future_draws]
+        a_mean, b_mean = a.clone(), 2*full - a  # the two halves use disjoint draws on every rank
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(a_mean, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(b_mean, op=torch.distributed.ReduceOp.AVG)
+        signal = (a_mean*b_mean).sum().item()           # unbiased for the squared future term
+        noise = (a_mean-b_mean).square().sum().item()/4  # variance of the whole-budget estimate
+        ema = e.js_moments.setdefault(site, [signal, noise])
+        ema[0], ema[1] = .95*ema[0]+.05*signal, .95*ema[1]+.05*noise
+        # momentum (beta 0.9) averages independent probe noise over steps by (1-beta)/(1+beta)
+        weight = min(1., max(0., ema[0]/(ema[0]+ema[1]*(1-shrink)/(1+shrink)+1e-30)))
+        e.diag['js_'+site.replace('transformer.', '').replace('.weight', '')] = round(weight, 3)
+        gradients[site + '.weight'] += (weight*full).to(gradients[site + '.weight'].dtype)
 
 
 @torch.no_grad()
@@ -3295,6 +3319,7 @@ def main():
     parser.add_argument('--future-hub', action='store_true')
     parser.add_argument('--future-noise', type=int, default=0)
     parser.add_argument('--tie-embed', action='store_true')
+    parser.add_argument('--future-js', type=float, default=0.0)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
@@ -3340,7 +3365,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, tie_embed=args.tie_embed, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, tie_embed=args.tie_embed, future_js=args.future_js, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
