@@ -181,6 +181,9 @@ class Tricks:
     directions U, carried across steps; every token is probed along them too, so the credit is U U^T g exactly plus
     the random probes' estimate of the complement (unbiased, since U comes from earlier steps). U follows the
     credit's leading directions by an Oja step of size future_learned_lr. Logs the share of credit energy U held.
+    future_hub: the hidden-unit future probes move the 512-wide stream the MLP writes to instead of its 2048 units, then
+    take the one allowed local step back (g W_out times each unit's squared-ReLU finite difference, as the chain's own
+    hidden credit does): a cycle four times shorter for the same number of probes.
     probe_memory, probe_sampled: AIM-ZO on the chain. With probe_rank r, each root keeps a memory of its top-M credit
     directions (M = probe_memory). A step probes the top r (shared), probe_sampled fresh orthonormal directions drawn
     from the rest of the memory, and probe_explore random ones in the complement of the memory, read back unbiased
@@ -229,6 +232,7 @@ class Tricks:
     jaguar: bool = False
     jaguar_beta: float = 0.0
     future_learned: int = 0
+    future_hub: bool = False
     future_learned_lr: float = 0.1
     key_learned: int = 0
     probe_memory: int = 0
@@ -2132,6 +2136,11 @@ def signed_hidden_moves(raw, directions, step, weight):
     return torch.cat((center+moved, center-moved), 1)
 
 
+def future_residual_moves(directions, step):
+    delta = step[:, None]*directions
+    return torch.cat((delta, -delta), 1)
+
+
 def future_embedding_moves(raw, directions, step):
     delta = step[:, None]*directions
     return torch.cat((norm_delta(raw[:, None], delta), norm_delta(raw[:, None], -delta)), 1)
@@ -2306,7 +2315,9 @@ class FiniteFuture:
     def experiment(self, family, layer, raw, sl, receivers, start):
         """Bind clean tensors once per token chunk, outside the direction loop."""
         model = self.e.model
-        if family == "hidden":
+        if family == "hub":
+            response = future_residual_moves
+        elif family == "hidden":
             response = partial(compiled_hidden, raw[sl],
                                weight=model.transformer.h[layer].mlp.c_proj.weight.float())
         elif family == "wte":
@@ -2366,10 +2377,13 @@ class FiniteFuture:
                 torch.cuda.synchronize()
             start = time.perf_counter()
             raw = d.outputs[name][self.sequence].float()
+            hub = family == "hidden" and getattr(getattr(e, 'tricks', None), 'future_hub', False)
+            if hub:  # probe the 512-wide stream the MLP writes to, then one local step back to its units
+                unit, raw, family = raw, self.contexts[layer+1]["x"], "hub"
             t, width = raw.shape
             if budgets[-1] > width:
                 raise ValueError(f"{name}: budget {budgets[-1]} exceeds the {width}-direction cycle")
-            gen = torch.Generator(raw.device).manual_seed(self.seed+7919*(layer+2)+101*("hidden query wte".split().index(family)))
+            gen = torch.Generator(raw.device).manual_seed(self.seed+7919*(layer+2)+101*("hidden query wte hub".split().index(family)))
             # Per-token random signs/offsets prevent a shared low-rank projection
             # from persisting in the batch's parameter gradient.
             frame = hadamard(width, raw.device, torch.float32)
@@ -2410,6 +2424,11 @@ class FiniteFuture:
                         credits[p][sl] = exact+c-(c @ basis.T) @ basis
             if basis is not None:
                 self.learn_basis(name, basis, credits[budgets[-1]])
+            if hub:
+                w_out = model.transformer.h[layer].mlp.c_proj.weight.float()
+                unit_steps = self.sigma*unit.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+                credits = {p: hidden_local_credit(unit, unit_steps, c, w_out) for p, c in credits.items()}
+                family = "hidden"
             for p in budgets:
                 result[p][name] = credits[p][None]
             if self.timing and d.x.is_cuda:
@@ -3217,6 +3236,7 @@ def main():
     parser.add_argument('--jaguar', action='store_true')
     parser.add_argument('--jaguar-beta', type=float, default=0.0)
     parser.add_argument('--future-learned', type=int, default=0)
+    parser.add_argument('--future-hub', action='store_true')
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
@@ -3262,7 +3282,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
