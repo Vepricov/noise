@@ -199,6 +199,8 @@ class Tricks:
     no_paths: drop the attention paths (future, input-K, value and gate probes); only the own-query chain is left.
     full_warmdown: the probe budgets above hold until Cut's warmdown starts; from there on the recipe's own budgets
     (less estimator noise where the rate decays, as a growing batch in place of a decaying rate).
+    warmdown_future: future probes from the start of Cut's warmdown on (0 keeps the budget above); the other probes
+    stay as they are, so only the part that carries most of the cut's cost grows where the rate decays.
     merge_long: the end merge also keeps means with weights 0.005 and 0.0025 on the newest weights and the equal mean
     of every merge point (Polyak averaging): a noisier estimator wants a longer mean than the recipe's 0.01.
     final_rate: the warmdown ends at this fraction of each rate in place of the recipe's 0.3 (-1 keeps it): the noise
@@ -233,6 +235,7 @@ class Tricks:
     probe_sampled: int = 0
     no_paths: bool = False
     full_warmdown: bool = False
+    warmdown_future: int = 0
     merge_long: bool = False
     final_rate: float = -1.0
     matrix_rule: str = 'polar'
@@ -3112,6 +3115,11 @@ def train_stages(args, settings, device, rank, world, tricks=Tricks()):
                 tricks = replace(tricks, future_draws=-1, key_path_draws=-1, query_keys=-1)
                 estimator.close()
                 estimator = estimator_for(model, phase)
+            if (tricks.warmdown_future and phase == 'cut' and horizon - phase_step < settings.warmdown * horizon
+                    and tricks.future_draws != tricks.warmdown_future):
+                tricks = replace(tricks, future_draws=tricks.warmdown_future)
+                estimator.tricks = tricks  # in place: learned key and chain subspaces carry on
+                estimator.s = replace(estimator.s, future_draws=tricks.warmdown_future)
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
             torch.cuda.synchronize()
             elapsed = previous_seconds + time.perf_counter()-start-paused
@@ -3212,6 +3220,7 @@ def main():
     parser.add_argument('--probe-sampled', type=int, default=0)
     parser.add_argument('--no-paths', action='store_true')
     parser.add_argument('--full-warmdown', action='store_true')
+    parser.add_argument('--warmdown-future', type=int, default=0)
     parser.add_argument('--merge-long', action='store_true')
     parser.add_argument('--final-rate', type=float, default=-1.0)
     parser.add_argument('--route-k', type=int, default=-1)
@@ -3250,7 +3259,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
