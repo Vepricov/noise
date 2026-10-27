@@ -233,6 +233,7 @@ class Tricks:
     jaguar_beta: float = 0.0
     future_learned: int = 0
     future_hub: bool = False
+    future_noise: int = 0
     future_learned_lr: float = 0.1
     key_learned: int = 0
     probe_memory: int = 0
@@ -2479,6 +2480,10 @@ def add_future_gradients(estimator, gradients):
                           query_mlp=True, timing=False)
     future.future_sites = (2*s.future_layers+1)*d.batch
     e.future_held_sum = 0.0
+    every = getattr(e.tricks, 'future_noise', 0)
+    e.future_calls = getattr(e, 'future_calls', 0)+1
+    if every and e.rank == 0 and (e.future_calls-1) % every == 0:
+        future_noise_report(e, future, gradients, seed)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
@@ -2498,6 +2503,47 @@ def add_future_gradients(estimator, gradients):
                 gradient.addmm_(credit[0].T, inputs)
         future.contexts = None
         del corrections
+
+
+@torch.no_grad()
+def future_noise_report(e, future, gradients, seed):
+    """Diagnostic: per probe family, the error of 32 and 128 future draws against the full cycle, on the first
+    sequence, in the credit and in the weight gradient, next to the norm of the step's estimate so far."""
+    d, out = e.capture, {'future_noise': e.future_calls}
+    future.seed = seed + 7
+    future.prepare(0)
+
+    def gradient(site, credit):
+        inputs = d.inputs[site][0]
+        if 'mlp.c_fc' in site:
+            raw = d.outputs[site][0].float()
+            credit = credit * (raw + e.s.future_sigma*raw.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6) > 0)[None]
+        if site == 'transformer.wte':
+            g = torch.zeros_like(gradients[site + '.weight'])
+            return g.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2))
+        return credit[0].T @ inputs.float()
+
+    tricks = e.tricks
+    for family, hub, full in (('hidden', False, 4*e.width), ('hidden', True, e.width), ('query', False, e.width),
+                              ('wte', False, e.width)):
+        e.tricks = replace(tricks, future_hub=hub)
+        res = future.estimate((32, 128, full), families=(family,))
+        name = 'hub' if hub else family
+        for site, exact in res[full].items():
+            g_full = gradient(site, exact)
+            row = {'grad': round(g_full.norm().item(), 6), 'total': round(gradients[site + '.weight'].norm().item(), 6)}
+            for p in (32, 128):
+                row[f'c{p}'] = round(((res[p][site]-exact).square().sum()/exact.square().sum().clamp_min(1e-30)).item(), 4)
+                row[f'g{p}'] = round((gradient(site, res[p][site])-g_full).norm().item(), 6)
+            out[f'{name}:{site}'] = row
+            if hub:
+                out[f'{name}:{site}']['cos_full'] = round(F.cosine_similarity(
+                    g_full.flatten(), out.pop('_h:'+site).flatten(), dim=0).item(), 4)
+            elif family == 'hidden':
+                out['_h:'+site] = g_full
+    e.tricks = tricks
+    future.contexts = None
+    print(json.dumps(out), flush=True)
 
 
 # ------------------------------------------------------------------------------------------------------ optimizer
@@ -3237,6 +3283,7 @@ def main():
     parser.add_argument('--jaguar-beta', type=float, default=0.0)
     parser.add_argument('--future-learned', type=int, default=0)
     parser.add_argument('--future-hub', action='store_true')
+    parser.add_argument('--future-noise', type=int, default=0)
     parser.add_argument('--future-learned-lr', type=float, default=0.1)
     parser.add_argument('--key-learned', type=int, default=0)
     parser.add_argument('--probe-memory', type=int, default=0)
@@ -3282,7 +3329,7 @@ def main():
                         future_draws=args.future_draws, key_path_draws=args.key_path_draws,
                         query_keys=args.query_keys, chain_rows=args.chain_rows, probe_seed=args.probe_seed, jaguar=args.jaguar, jaguar_beta=args.jaguar_beta,
                         future_learned=args.future_learned,
-                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
+                        future_learned_lr=args.future_learned_lr, future_hub=args.future_hub, future_noise=args.future_noise, key_learned=args.key_learned, probe_memory=args.probe_memory, probe_sampled=args.probe_sampled, no_paths=args.no_paths, full_warmdown=args.full_warmdown, warmdown_future=args.warmdown_future, merge_long=args.merge_long, final_rate=args.final_rate, route_k=args.route_k, matrix_rule=args.matrix_rule, matrix_power=args.matrix_power, zo_probes=args.zo_probes, zo_scope=args.zo_scope, zo_tau=args.zo_tau, zo_beta=args.zo_beta, zo_act_rank=args.zo_act_rank, zo_adaptive=args.zo_adaptive, zo_history=args.zo_history, zo_scale=args.zo_scale, profile=args.profile)
         MATRIX_RULE[:] = [tricks.matrix_rule, tricks.matrix_power]
         if tricks.merge_long:
             MERGE_DECAYS.extend(MERGE_LONG)
