@@ -3450,6 +3450,13 @@ def train_stages(args, settings, device, rank, world):
     optimizer, estimator = make_optimizer(model, settings, phases[phase]), estimator_for(model, phase)
     if args.resume:
         completed, previous_seconds = restore_training_state(args.resume, model, optimizer, estimator, recipe=recipe_state)
+
+    def tie():  # the embedding table is the head: its rows follow the head's exact first-order gradient
+        with torch.no_grad():
+            model.transformer.wte.weight.copy_(model.lm_head.weight)
+
+    if args.tie_embed:
+        tie()
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -3465,6 +3472,8 @@ def train_stages(args, settings, device, rank, world):
             batch = rank_slice(training[begin:end], phase)
             set_rate(optimizer, phase_step, horizon, settings.warmdown, settings.final)
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+            if args.tie_embed:
+                tie()
             torch.cuda.synchronize()
             elapsed = previous_seconds + time.perf_counter()-start-paused
             record = dict(step=step, phase=phase, phase_step=phase_step, seqs=end,
@@ -3534,6 +3543,7 @@ def main():
     parser.add_argument('--stop-after-step', type=int)
     parser.add_argument('--steps', type=int, help='Diagnostic prefix; preserves the full-epoch LR schedule.')
     parser.add_argument('--smoke', action='store_true', help=argparse.SUPPRESS)  # checks: 44 rows, small chunks
+    parser.add_argument('--tie-embed', action='store_true', help='Copy the head into the embedding after every update.')
     args = parser.parse_args()
     for key in ('steps', 'stop_after_step'):
         if getattr(args, key) is not None and getattr(args, key) < 1:
